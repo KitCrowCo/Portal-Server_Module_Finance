@@ -76,6 +76,7 @@ def _conn(gid: str) -> sqlite3.Connection:
     _ensure_column(c, "recurring", "auto_pay", "INTEGER")
     _ensure_column(c, "recurring", "hourly_rate", "REAL")
     _ensure_column(c, "recurring", "hours_per_day", "REAL")
+    _ensure_column(c, "recurring", "deduction_pct", "REAL")
     return c
 
 def _accounts(gid: str) -> list: c = _conn(gid); rows = [dict(r) for r in c.execute("SELECT * FROM accounts ORDER BY type, label")]; c.close(); return rows
@@ -130,7 +131,7 @@ def _materialize(gid: str, horizon_days: int = HORIZON_DAYS):
             if occ.isoformat() in skip: continue
             if rec["kind"] == "wage":
                 p_start, p_end = _wage_period_bounds(rec, occ)
-                amt = _weekday_count(p_start, p_end) * (rec["hours_per_day"] or 8.0) * (rec["hourly_rate"] or 0.0)
+                amt = _weekday_count(p_start, p_end) * (rec["hours_per_day"] or 8.0) * (rec["hourly_rate"] or 0.0) * (1 - (rec.get("deduction_pct") or 0)/100)
                 conn.execute("INSERT INTO entries VALUES (?,?,?,?,?,?,?,?,?,?)", (uuid.uuid4().hex[:10], rec["account_id"], occ.isoformat(), rec["label"], amt, rec["category"], 1, rec["id"], None, 0))
             elif rec["kind"] == "transfer":
                 e1, e2 = uuid.uuid4().hex[:10], uuid.uuid4().hex[:10]
@@ -160,10 +161,11 @@ def _debt_total(balances: dict) -> float: return sum(v["balance"] for v in balan
 # Grid always spans full weeks including adjacent-month lead/trail days, so end-of-month never leaves the next few days looking unknown.
 
 def _extended_grid(gid: str, center_year: int, center_month: int) -> list:
-    """9 full weeks (63 days): 4 weeks before the week containing the 1st of center_month, through 4 weeks after. Days belonging to center_month are marked in_month=True for highlighting; everything else is context."""
+    """9 full weeks (63 days), centered on the MIDDLE of center_month (not day 1) so coverage into the adjacent month on either side stays roughly symmetric regardless of which weekday the month happens to start on."""
     conn = _conn(gid)
-    center_first = date(center_year, center_month, 1)
-    center_start = center_first - timedelta(days=center_first.weekday())
+    last_day = calendar.monthrange(center_year, center_month)[1]
+    center_anchor = date(center_year, center_month, min(15, last_day))
+    center_start = center_anchor - timedelta(days=center_anchor.weekday())
     grid_start = center_start - timedelta(days=28)
     grid_end = grid_start + timedelta(days=62)
     entries = conn.execute("SELECT * FROM entries WHERE date>=? AND date<=? ORDER BY date", (grid_start.isoformat(), grid_end.isoformat())).fetchall()
@@ -181,7 +183,8 @@ def _day_cell_html(cell, gid) -> str:
     d, entries, liquid, in_month = cell["date"], cell["entries"], cell["liquid"], cell["in_month"]
     cls = "fin-day" + (" fin-day-today" if d == date.today() else "") + ("" if in_month else " fin-day-other-month")
     rows = "".join(f"""<div class="fin-entry" style="color:{'#00ffa2' if e['amount']>=0 else '#ff8c8c'}" title="{_esc(e['label'])}">{_esc(e['label'][:14])} {_money(e['amount'])}{' ~' if not e.get('confirmed') and e.get('projected') else ''}</div>""" for e in entries[:3])
-    more = f'<div class="dim tiny">+{len(entries)-3} more</div>' if len(entries) > 3 else ""
+    more_labels = "; ".join(f"{e['label']} {_money(e['amount'])}" for e in entries[3:])
+    more = f'<div class="dim tiny" title="{_esc(more_labels)}">+{len(entries)-3} more</div>' if len(entries) > 3 else ""
     return f"""<div class="{cls}" hx-post="/im/in" hx-target="body" hx-swap="none" hx-vals='{json.dumps({"type":"finance_day_open","lvl":1,"date":d.isoformat()})}'>
                    <div class="fin-day-num">{d.day}</div>{rows}{more}
                    <div class="fin-day-liquid" style="color:{'#00ffa2' if liquid>=0 else '#ff5f5f'}">{_money(liquid)}</div>
@@ -198,7 +201,7 @@ def _calendar_html(gid: str, year: int, month: int) -> str:
     balances = _balances_at(gid, date.today())
     liquid, debt = _liquid_total(balances), _debt_total(balances)
     header = f"""<div class="info-bar" style="justify-content:space-between">
-                     <span>Liquid now: <b style="color:{'#00ffa2' if liquid>=0 else '#ff5f5f'}">{_money(liquid)}</b></span>
+                     <span>Liquid now: <b style="color:{'#00ffa2' if liquid>=0 else '#ff5f5f'};font-size:1.3em">{_money(liquid)}</b></span>
                      <span>Debt owed: <b style="color:#ffaa44">{_money(debt)}</b></span>
                  </div>
                  <div style="display:flex;align-items:center;gap:.5rem;margin-bottom:.4rem">
@@ -297,7 +300,7 @@ def _recurring_form_html(gid: str, rec: dict = None) -> str:
     return f"""<form hx-post="/im/in" hx-target="body" hx-swap="none" hx-include="this" class="glass" style="padding:.6rem;display:flex;flex-direction:column;gap:.4rem">
                    <input type="hidden" name="type" value="finance_recurring_save"><input type="hidden" name="lvl" value="1"><input type="hidden" name="id" value="{rec['id']}">
                    <input type="text" name="label" value="{_esc(rec['label'])}" placeholder="e.g. Rent, Paycheck, Card Payment" class="module-select" required>
-                   <select name="kind" class="module-select">{"".join(f'<option value="{k}" {"selected" if rec["kind"]==k else ""}>{l}</option>' for k,l in (("expense","Expense"),("income","Income"),("wage","Hourly Wage (per weekday, computed per pay period)"),("transfer","Transfer / Auto-pay between accounts")))}</select>
+                   <select name="kind" class="module-select">{"".join(f'<option value="{k}" {"selected" if rec["kind"]==k else ""}>{l}</option>' for k,l in (("expense","Bill / Expense (leaves an account)"),("income","Income (arrives in an account)"),("wage","Hourly Wage (paid per worked weekday)"),("transfer","Transfer / Card Payment (moves between two of your own accounts)")))}</select>
                    <label class="dim">From / affected account<select name="account_id" class="module-select">{opts(rec["account_id"])}</select></label>
                    <label class="dim">To account (transfer only)<select name="to_account_id" class="module-select"><option value="">-</option>{opts(rec["to_account_id"])}</select></label>
                    <div style="display:flex;gap:.4rem">
@@ -307,6 +310,7 @@ def _recurring_form_html(gid: str, rec: dict = None) -> str:
                    <div style="display:flex;gap:.4rem">
                        <input type="number" name="hourly_rate" step="0.01" value="{rec.get('hourly_rate') or ''}" placeholder="Hourly rate (wage kind only)" class="module-select" style="flex:1">
                        <input type="number" name="hours_per_day" step="0.25" value="{rec.get('hours_per_day') or 8}" placeholder="Hours/weekday" class="module-select" style="flex:1">
+                       <input type="number" name="deduction_pct" step="0.0001" value="{rec.get('deduction_pct') or 0}" placeholder="Deduction % (taxes etc)" class="module-select" style="flex:1">
                    </div>
                    <select name="frequency" class="module-select">{"".join(f'<option value="{f}" {"selected" if rec["frequency"]==f else ""}>{l}</option>' for f,l in (("weekly","Weekly"),("biweekly","Every 2 weeks"),("semimonthly","Twice a month (e.g. 1st & 15th)"),("monthly","Monthly"),("yearly","Yearly")))}</select>
                    <div style="display:flex;gap:.4rem">
@@ -315,10 +319,12 @@ def _recurring_form_html(gid: str, rec: dict = None) -> str:
                        <label class="dim" style="flex:1">2nd day (semimonthly)<input type="number" name="day2" min="1" max="31" value="{rec['day2']}" class="module-select"></label>
                    </div>
                    <input type="text" name="category" value="{_esc(rec['category'])}" placeholder="Category (optional)" class="module-select">
-                   <label style="display:flex;align-items:center;gap:.4rem;font-size:.8rem"><input type="checkbox" name="auto_pay" value="1" {"checked" if rec["auto_pay"] else ""}> Auto-deducted (no action needed when it hits) - separate from notify below</label>
+                   <label style="display:flex;align-items:center;gap:.4rem;font-size:.8rem">
+                       <input type="checkbox" name="auto_pay" value="1" {"checked" if rec["auto_pay"] else ""}> This happens automatically (no action needed from you when it hits) - separate from whether you get notified below
+                   </label>
                    <div style="display:flex;gap:.6rem;align-items:center">
                        <label style="display:flex;align-items:center;gap:.3rem;font-size:.8rem"><input type="checkbox" name="notify" value="1" {"checked" if rec["notify"] else ""}> Notify me</label>
-                       <label class="dim" style="font-size:.78rem">days before<input type="number" name="notify_days_before" min="0" max="30" value="{rec['notify_days_before']}" class="module-select" style="width:4rem"></label>
+                       <label class="dim" style="font-size:.8rem">days before<input type="number" name="notify_days_before" min="0" max="30" value="{rec['notify_days_before']}" class="module-select" style="width:4rem"></label>
                        <label style="display:flex;align-items:center;gap:.3rem;font-size:.8rem;margin-left:auto"><input type="checkbox" name="active" value="1" {"checked" if rec["active"] else ""}> Active</label>
                    </div>
                    <button type="submit" class="button">Save Recurring Item</button>
@@ -542,7 +548,7 @@ async def _h_recurring_save(request, payload, imr):
     gid = await _active_group(request)
     rid = payload.get("id","") or uuid.uuid4().hex[:10]
     conn = _conn(gid)
-    conn.execute("INSERT OR REPLACE INTO recurring (id,label,kind,account_id,to_account_id,amount,is_estimate,frequency,anchor_date,day1,day2,notify,notify_days_before,category,active,last_notified_date,auto_pay,hourly_rate,hours_per_day) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+    conn.execute("INSERT OR REPLACE INTO recurring (id,label,kind,account_id,to_account_id,amount,is_estimate,frequency,anchor_date,day1,day2,notify,notify_days_before,category,active,last_notified_date,auto_pay,hourly_rate,hours_per_day,deduction_pct) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                  (rid, payload.get("label","").strip(), payload.get("kind","expense"), payload.get("account_id",""), payload.get("to_account_id","") or None,
                   float(payload.get("amount",0) or 0), 1 if payload.get("is_estimate") else 0, payload.get("frequency","monthly"), payload.get("anchor_date", date.today().isoformat()),
                   int(payload.get("day1",1) or 1), int(payload.get("day2",15) or 15), 1 if payload.get("notify") else 0, int(payload.get("notify_days_before",2) or 2),
@@ -658,13 +664,13 @@ async def export_db(gid: str, request: Request):
 CSS = """
 .fin-cal-grid { display:flex; flex-direction:column; gap:var(--border-thick); border:var(--border-thick) solid var(--border); border-radius:var(--radius); overflow:hidden; }
 .fin-week { display:grid; grid-template-columns:repeat(7,1fr); gap:var(--border-thick); background:var(--border); }
+.fin-day { background:var(--bg); min-height:5rem; max-height:9rem; min-width:0; overflow:hidden; padding:0.25rem 0.3rem; cursor:pointer; display:flex; flex-direction:column; gap:0.05rem; font-size:calc(var(--font-size)*0.7); }
 .fin-dow-row { background:transparent; }
 .fin-dow { text-align:center; font-size:calc(var(--font-size)*0.7); color:var(--text_muted); text-transform:uppercase; padding:0.2rem 0; background:var(--bg_panel); }
-.fin-day { background:var(--bg); min-height:5rem; padding:0.2rem 0.3rem; cursor:pointer; display:flex; flex-direction:column; gap:0.1rem; font-size:calc(var(--font-size)*0.7); }
 .fin-day:hover { background:var(--accent_dim); }
 .fin-day-other-month { opacity:0.4; }
 .fin-day-today { border:var(--border-thick) solid var(--accent); }
-.fin-day-num { font-weight:700; font-size:calc(var(--font-size)*0.85); }
+.fin-day-num { font-weight:700; font-size:calc(var(--font-size)*0.8); }
 .fin-entry { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-.fin-day-liquid { margin-top:auto; font-weight:600; font-size:calc(var(--font-size)*0.65); }
+.fin-day-liquid { margin-top:auto; font-weight:600; font-size:calc(var(--font-size)*0.4); }
 """
