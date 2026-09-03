@@ -50,9 +50,9 @@ async def _active_group(request) -> str:
     return _ensure_personal_group(request.state.user.username)
 
 def _real_usernames() -> set:
-    """Reads usernames via the platform's already-injected get_db dependency and a raw SQL SELECT - avoids importing the core User model from an uncertain relative path (a dynamically loaded module's __package__ doesn't reliably resolve '..database' style imports back into the core package). Raw SQL against the known 'users' table is deliberately minimal surface: one column read, no ORM coupling, no guessed import path."""
+    """Reads usernames via the platform's already-injected db dependency and a raw SQL SELECT - avoids importing the core User model from an uncertain relative path (a dynamically loaded module's __package__ doesn't reliably resolve '..database' style imports back into the core package). Raw SQL against the known 'users' table is deliberately minimal surface: one column read, no ORM coupling, no guessed import path."""
     from contextlib import contextmanager
-    with contextmanager(ENV["get_db"])() as db:
+    with contextmanager(ENV["db"])() as db:
         return {r[0] for r in db.execute(text("SELECT username FROM users"))}
 
 # --- DB ---
