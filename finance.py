@@ -548,12 +548,33 @@ async def _h_recurring_save(request, payload, imr):
     gid = await _active_group(request)
     rid = payload.get("id","") or uuid.uuid4().hex[:10]
     conn = _conn(gid)
-    conn.execute("INSERT OR REPLACE INTO recurring (id,label,kind,account_id,to_account_id,amount,is_estimate,frequency,anchor_date,day1,day2,notify,notify_days_before,category,active,last_notified_date,auto_pay,hourly_rate,hours_per_day,deduction_pct) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                 (rid, payload.get("label","").strip(), payload.get("kind","expense"), payload.get("account_id",""), payload.get("to_account_id","") or None,
-                  float(payload.get("amount",0) or 0), 1 if payload.get("is_estimate") else 0, payload.get("frequency","monthly"), payload.get("anchor_date", date.today().isoformat()),
-                  int(payload.get("day1",1) or 1), int(payload.get("day2",15) or 15), 1 if payload.get("notify") else 0, int(payload.get("notify_days_before",2) or 2),
-                  payload.get("category","").strip(), 1 if payload.get("active") else 0, None, 1 if payload.get("auto_pay") else 0,
-                  float(payload.get("hourly_rate")) if payload.get("hourly_rate") not in ("",None) else None, float(payload.get("hours_per_day")) if payload.get("hours_per_day") not in ("",None) else None))
+    conn.execute("INSERT OR REPLACE INTO recurring (id,label,kind,account_id,to_account_id,amount,is_estimate,frequency,anchor_date,day1,day2,notify,notify_days_before,category,active,last_notified_date,auto_pay,hourly_rate,hours_per_day,deduction_pct) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",(
+        rid,
+        payload.get("label", "").strip(),
+        payload.get("kind", "expense"),
+        payload.get("account_id", ""),
+        payload.get("to_account_id", "") or None,
+        float(payload.get("amount", 0) or 0),
+        1 if payload.get("is_estimate") else 0,
+        payload.get("frequency", "monthly"),
+        payload.get("anchor_date", date.today().isoformat()),
+        int(payload.get("day1", 1) or 1),
+        int(payload.get("day2", 15) or 15),
+        1 if payload.get("notify") else 0,
+        int(payload.get("notify_days_before", 2) or 2),
+        payload.get("category", "").strip(),
+        1 if payload.get("active") else 0,
+        None,
+        1 if payload.get("auto_pay") else 0,
+        float(payload.get("hourly_rate")) if payload.get("hourly_rate") not in ("", None) else None,
+        float(payload.get("hours_per_day")) if payload.get("hours_per_day") not in ("", None) else None,
+        float(payload.get("deduction_pct")) if payload.get("deduction_pct") not in ("", None) else None,),)
+    # conn.execute("INSERT OR REPLACE INTO recurring (id,label,kind,account_id,to_account_id,amount,is_estimate,frequency,anchor_date,day1,day2,notify,notify_days_before,category,active,last_notified_date,auto_pay,hourly_rate,hours_per_day,deduction_pct) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+    #              (rid, payload.get("label","").strip(), payload.get("kind","expense"), payload.get("account_id",""), payload.get("to_account_id","") or None,
+    #               float(payload.get("amount",0) or 0), 1 if payload.get("is_estimate") else 0, payload.get("frequency","monthly"), payload.get("anchor_date", date.today().isoformat()),
+    #               int(payload.get("day1",1) or 1), int(payload.get("day2",15) or 15), 1 if payload.get("notify") else 0, int(payload.get("notify_days_before",2) or 2),
+    #               payload.get("category","").strip(), 1 if payload.get("active") else 0, None, 1 if payload.get("auto_pay") else 0,
+    #               float(payload.get("hourly_rate")) if payload.get("hourly_rate") not in ("",None) else None, float(payload.get("hours_per_day")) if payload.get("hours_per_day") not in ("",None) else None))
     conn.commit(); conn.close()
     _materialize(gid)
     imr.oob(_recurring_list_html(gid), "fin-recurring-list", swap="outerHTML")
