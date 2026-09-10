@@ -47,6 +47,8 @@ async def _active_group(request) -> str:
     gid = await ENV["get_state"](request, scope="user", namespace="finance", key="active_group")
     groups = _load_groups()
     if gid and gid in groups and request.state.user.username in groups[gid].get("members", []): return gid
+    default_gid = await ENV["get_state"](request, scope="user", namespace="finance", key="default_group")
+    if default_gid and default_gid in groups and request.state.user.username in groups[default_gid].get("members", []): return default_gid
     return _ensure_personal_group(request.state.user.username)
 
 def _real_usernames() -> set:
@@ -81,8 +83,23 @@ def _conn(gid: str) -> sqlite3.Connection:
 
 def _accounts(gid: str) -> list: c = _conn(gid); rows = [dict(r) for r in c.execute("SELECT * FROM accounts ORDER BY type, label")]; c.close(); return rows
 def _account_map(gid: str) -> dict: return {a["id"]: a for a in _accounts(gid)}
-def _recurring(gid: str) -> list: c = _conn(gid); rows = [dict(r) for r in c.execute("SELECT * FROM recurring ORDER BY active DESC, label")]; c.close(); return rows
 def _entry(gid: str, eid: str): c = _conn(gid); r = c.execute("SELECT * FROM entries WHERE id=?", (eid,)).fetchone(); c.close(); return dict(r) if r else None
+
+def _display_day(r: dict) -> str:
+    if r["frequency"] == "monthly": return f"day {r['day1']}"
+    if r["frequency"] == "semimonthly": return f"days {r['day1']} & {r['day2']}"
+    if r["frequency"] in ("weekly","biweekly"): return date.fromisoformat(r["anchor_date"]).strftime("%A")
+    if r["frequency"] == "yearly": return date.fromisoformat(r["anchor_date"]).strftime("%b %d")
+    return ""
+
+def _recurring(gid: str) -> list:
+    c = _conn(gid)
+    rows = [dict(r) for r in c.execute("SELECT * FROM recurring")]
+    c.close()
+    def sort_key(r):
+        day = date.fromisoformat(r["anchor_date"]).day if r["frequency"] in ("weekly","biweekly","yearly") else (r["day1"] or 1)
+        return (not r["active"], day, r["label"])
+    return sorted(rows, key=sort_key)
 
 # --- Occurrence generation (recurring rule -> concrete calendar dates) ---
 
@@ -145,14 +162,15 @@ def _materialize(gid: str, horizon_days: int = HORIZON_DAYS):
 # --- Balance calculation ---
 
 def _balances_at(gid: str, target: date) -> dict:
-    conn = _conn(gid)
-    out = {}
+    conn = _conn(gid); out = {}
     for a in [dict(r) for r in conn.execute("SELECT * FROM accounts")]:
-        asof = date.fromisoformat(a["asof"]) if a["asof"] else date.today()
-        delta = conn.execute("SELECT COALESCE(SUM(amount),0) s FROM entries WHERE account_id=? AND date>? AND date<=?", (a["id"], asof.isoformat(), target.isoformat())).fetchone()["s"]
-        out[a["id"]] = {**a, "balance": a["balance"] + delta}
+        asof = date.fromisoformat(a["asof"]) if a.get("asof") else target
+        confirmed_delta = conn.execute("SELECT COALESCE(SUM(amount),0) s FROM entries WHERE account_id=? AND confirmed=1 AND date>? AND date<=?", (a["id"], asof.isoformat(), target.isoformat())).fetchone()["s"]
+        pending_delta = conn.execute("SELECT COALESCE(SUM(amount),0) s FROM entries WHERE account_id=? AND confirmed=0", (a["id"],)).fetchone()["s"] if target >= date.today() else 0.0
+        out[a["id"]] = {**a, "balance": a["balance"] + confirmed_delta + pending_delta, "is_liquid": bool(a["is_liquid"])}
     conn.close()
     return out
+
 
 def _liquid_total(balances: dict) -> float: return sum(v["balance"] for v in balances.values() if v["is_liquid"])
 def _debt_total(balances: dict) -> float: return sum(v["balance"] for v in balances.values() if v["type"] in ("credit", "debt"))
@@ -236,7 +254,11 @@ def _quick_add_html(gid: str) -> str:
     accounts = _accounts(gid)
     opts = "".join(f'<option value="{a["id"]}">{_esc(a["label"])}</option>' for a in accounts)
     return f"""<form hx-post="/im/in" hx-target="body" hx-swap="none" hx-include="this" style="display:flex;flex-direction:column;gap:.4rem">
-                   <input type="hidden" name="type" value="finance_quick_add"><input type="hidden" name="lvl" value="1">
+                   <div style="display:flex;gap:.4rem">
+                       <input type="number" name="amount" step="0.01" min="0" placeholder="$ per unit" class="module-select" style="flex:1" required>
+                       <input type="number" name="qty" step="any" min="0" value="1" placeholder="x qty" class="module-select" style="width:5rem">
+                       <label style="display:flex;align-items:center;gap:.4rem;font-size:.8rem"><input type="checkbox" name="pending" value="1" checked> Not paid yet (bill I owe)</label>
+                   </div>
                    <select name="kind" class="module-select"><option value="expense">Expense</option><option value="income">Income</option></select>
                    <select name="account_id" class="module-select">{opts or '<option value="">Add an account first</option>'}</select>
                    <input type="text" name="label" placeholder="e.g. Groceries, Gas" class="module-select" required>
@@ -283,6 +305,7 @@ def _accounts_list_html(gid: str) -> str:
         util = f' <span class="dim tiny">({_money(abs(a["balance"]))} / {_money(a["credit_limit"])} limit, {abs(a["balance"])/a["credit_limit"]*100:.0f}%)</span>' if a["type"]=="credit" and a.get("credit_limit") else ""
         apr = f' <span class="dim tiny">{a["apr"]:.1f}% APR</span>' if a.get("apr") else ""
         notes_ind = f' <span class="dim tiny" title="{_esc(a["notes"])}">&#x1F4DD;</span>' if a.get("notes") else ""
+        asof_ind = f' <span class="dim tiny">as of {a["asof"]}</span>' if a.get("asof") else ""
         rows += f"""<div class="glass" style="padding:.5rem .7rem;margin-bottom:.3rem;display:flex;align-items:center;gap:.5rem">
                         <span style="flex:1;font-weight:600">{_esc(a['label'])}{notes_ind}</span><span class="dim tiny">{a['type']}</span>
                         <span style="color:{'#00ffa2' if a['balance']>=0 else '#ff5f5f'}">{_money(a['balance'])}</span>{util}{apr}
@@ -338,7 +361,9 @@ def _recurring_list_html(gid: str) -> str:
         est = " ~est" if r["is_estimate"] else ""
         rows += f"""<div class="glass" style="padding:.5rem .7rem;margin-bottom:.3rem;display:flex;align-items:center;gap:.5rem;opacity:{1 if r['active'] else .5}">
                         <span style="flex:1;font-weight:600">{_esc(r['label'])}</span>{badge}{auto_badge}
-                        <span class="dim tiny">{r['frequency']}</span><span>{_money(r['amount'])}{est}</span>
+                        <span class="dim tiny">{r['frequency']}</span>
+                        <span>{_money(r['amount'])}{est}</span>
+                        <span class="dim tiny">{_display_day(r)}</span>
                         <button class="cm-qbtn" hx-post="/im/in" hx-target="body" hx-swap="none" hx-vals='{json.dumps({"type":"finance_recurring_form","lvl":1,"id":r["id"]})}'>Edit</button>
                         <button class="cm-qbtn" style="color:#ff5f5f" hx-post="/im/in" hx-target="body" hx-swap="none" hx-vals='{json.dumps({"type":"finance_recurring_delete","lvl":1,"id":r["id"]})}' hx-confirm="Delete this recurring item?">&#x2715;</button>
                     </div>"""
@@ -351,6 +376,7 @@ async def _panel_calendar(request, gid):
     ym = await ENV["get_state"](request, scope="user", namespace="finance", key="cal_ym") or {"y": today.year, "m": today.month}
     return f"""<div style="padding:.9rem;height:100%;overflow-y:auto;box-sizing:border-box">
                    {_calendar_html(gid, ym["y"], ym["m"])}
+                   <div class="fsect-hd">Pending Bills</div>{_pending_html(gid)}
                    <div class="fsect-hd" style="margin-top:1rem">Quick Add</div>
                    {_quick_add_html(gid)}
                    <div class="fsect-hd" style="margin-top:1rem">Correct a Balance</div>
@@ -368,7 +394,16 @@ def _panel_settings(request, gid, warn=""):
     members = ", ".join(cur.get("members", []))
     return f"""<div style="padding:.9rem;height:100%;overflow-y:auto;box-sizing:border-box;max-width:36rem">
                    <div class="fsect-hd">Active Group</div>
-                   <select class="module-select" hx-post="/im/in" hx-target="#finance-panel" hx-swap="innerHTML" hx-trigger="change" hx-vals='{{"type":"finance_group_switch","lvl":1}}' hx-include="this" name="gid">{g_opts}</select>
+                   <div style="display:flex;gap:.4rem;align-items:center">
+                       <select class="module-select" style="flex:1;margin:0" hx-post="/im/in" hx-target="#finance-panel" hx-swap="innerHTML" hx-trigger="change" hx-vals='{{"type":"finance_group_switch","lvl":1}}' hx-include="this" name="gid">{g_opts}</select>
+                       <button type="button" class="cm-qbtn" hx-post="/im/in" hx-target="#finance-panel" hx-swap="innerHTML" hx-vals='{{"type":"finance_group_set_default","lvl":1,"gid":"{gid}"}}'>Set as Default</button>
+                   </div>
+                   <form hx-post="/im/in" hx-target="#finance-panel" hx-swap="innerHTML" hx-include="this" style="display:flex;gap:.4rem;margin-top:.5rem">
+                       <input type="hidden" name="type" value="finance_group_create"><input type="hidden" name="lvl" value="1">
+                       <input type="text" name="label" placeholder="New group name" class="module-select" style="flex:1">
+                       <button type="submit" class="button">+ Create Group</button>
+                   </form>
+                   <button type="button" class="cm-qbtn" style="color:#ff5f5f;margin-top:.4rem" hx-post="/im/in" hx-target="#finance-panel" hx-swap="innerHTML" hx-vals='{{"type":"finance_group_leave","lvl":1,"gid":"{gid}"}}' hx-confirm="Leave &#39;{_esc(cur.get('label',gid))}&#39;? If you&#39;re the only member, all its data is deleted permanently.">Leave / Delete This Group</button>
                    <div class="fsect-hd" style="margin-top:1rem">Group Members</div>
                    <p class="dim tiny">Only real usernames on this server are accepted - a typo is silently dropped rather than granting access to nobody.</p>
                    <form hx-post="/im/in" hx-target="#finance-panel" hx-swap="innerHTML" hx-include="this" style="display:flex;gap:.4rem">
@@ -446,6 +481,8 @@ def init_module(env: dict):
         "finance_entry_save": [_h_entry_save], "finance_entry_delete": [_h_entry_delete],
         "finance_account_form": [_h_account_form], "finance_account_save": [_h_account_save], "finance_account_delete": [_h_account_delete],
         "finance_recurring_form": [_h_recurring_form], "finance_recurring_save": [_h_recurring_save], "finance_recurring_delete": [_h_recurring_delete],
+        "finance_pending_pay_now": [_h_pending_pay_now], "finance_pending_mark_paid": [_h_pending_mark_paid],
+        "finance_group_create": [_h_group_create], "finance_group_set_default": [_h_group_set_default], "finance_group_leave": [_h_group_leave],
         "finance_group_switch": [_h_group_switch], "finance_group_members_save": [_h_group_members_save], "finance_threshold_save": [_h_threshold_save]})
     _ensure_notify_task()
     print("[finance] ready")
@@ -470,8 +507,10 @@ async def _h_day_open(request, payload, imr):
 async def _h_quick_add(request, payload, imr):
     gid = await _active_group(request)
     sign = 1 if payload.get("kind") == "income" else -1
+    amt = float(payload.get("amount",0) or 0) * float(payload.get("qty",1) or 1)
+    confirmed = 0 if payload.get("pending") == "1" else 1
     conn = _conn(gid)
-    conn.execute("INSERT INTO entries VALUES (?,?,?,?,?,?,?,?,?,?)", (uuid.uuid4().hex[:10], payload.get("account_id",""), payload.get("date", date.today().isoformat()), payload.get("label","").strip(), sign*abs(float(payload.get("amount",0) or 0)), "", 0, None, None, 1))
+    conn.execute("INSERT INTO entries VALUES (?,?,?,?,?,?,?,?,?,?)", (uuid.uuid4().hex[:10], payload.get("account_id",""), payload.get("date", date.today().isoformat()), payload.get("label","").strip(), sign*abs(amt), "", 0, None, None, confirmed))
     conn.commit(); conn.close()
     await _refresh_calendar(request, gid, imr)
     return imr
@@ -600,8 +639,11 @@ async def _h_group_members_save(request, payload, imr):
     valid = [m for m in requested if m in real]
     if request.state.user.username not in valid: valid.append(request.state.user.username)
     rejected = [m for m in requested if m not in real]
+    newly_added = set(valid) - set(groups[gid].get("members", []))
     groups[gid]["members"] = valid
     _save_groups(groups)
+    for member in newly_added:
+        if member != request.state.user.username: await ENV["send_push"](member, "Added to a finance group", f"You were added to '{groups[gid]['label']}'.", url=f"{_P}/?join_group={gid}")
     warn = f'<div style="color:#ffaa44;font-size:.75rem;margin-top:.3rem">Not added (no matching username on this server): {", ".join(rejected)}</div>' if rejected else ""
     return imr.raw(_panel_settings(request, gid, warn))
 
@@ -612,6 +654,68 @@ async def _h_threshold_save(request, payload, imr):
         groups[gid]["low_balance_threshold"] = float(payload.get("threshold", 100) or 100)
         _save_groups(groups)
     return imr
+
+# _h_quick_add - multiply before signing
+async def _h_quick_add(request, payload, imr):
+    gid = await _active_group(request)
+    sign = 1 if payload.get("kind") == "income" else -1
+    amt = float(payload.get("amount",0) or 0) * float(payload.get("qty",1) or 1)
+    conn = _conn(gid)
+    conn.execute("INSERT INTO entries VALUES (?,?,?,?,?,?,?,?,?,?)", (uuid.uuid4().hex[:10], payload.get("account_id",""), payload.get("date", date.today().isoformat()), payload.get("label","").strip(), sign*abs(amt), "", 0, None, None, 1))
+    conn.commit(); conn.close()
+    await _refresh_calendar(request, gid, imr)
+    return imr
+
+async def _h_pending_pay_now(request, payload, imr):
+    """Money leaves today, regardless of the bill's original due date."""
+    gid = await _active_group(request)
+    conn = _conn(gid)
+    conn.execute("UPDATE entries SET date=?, confirmed=1 WHERE id=?", (date.today().isoformat(), payload.get("id","")))
+    conn.commit(); conn.close()
+    await _refresh_calendar(request, gid, imr)
+    return imr
+
+async def _h_pending_mark_paid(request, payload, imr):
+    """Already handled elsewhere (e.g. autopay) - stop reserving against it, but don't touch today's actual liquid; keeps its original date so normal accounting picks it up on/after that date."""
+    gid = await _active_group(request)
+    conn = _conn(gid)
+    conn.execute("UPDATE entries SET confirmed=1 WHERE id=?", (payload.get("id",""),))
+    conn.commit(); conn.close()
+    await _refresh_calendar(request, gid, imr)
+    return imr
+
+async def _h_group_create(request, payload, imr):
+    name = (payload.get("label") or "").strip()
+    if not name: return imr
+    groups = _load_groups()
+    gid = f"g_{uuid.uuid4().hex[:10]}"
+    groups[gid] = {"label": name, "members": [request.state.user.username], "low_balance_threshold": 100.0, "last_low_balance_notify": None}
+    _save_groups(groups)
+    await ENV["set_state"](request, gid, scope="user", namespace="finance", key="active_group")
+    return imr.raw(_panel_settings(request, gid))
+
+async def _h_group_set_default(request, payload, imr):
+    gid = payload.get("gid","")
+    groups = _load_groups()
+    if gid in groups and request.state.user.username in groups[gid].get("members", []):
+        await ENV["set_state"](request, gid, scope="user", namespace="finance", key="default_group")
+    return imr.raw(_panel_settings(request, gid))
+
+async def _h_group_leave(request, payload, imr):
+    gid = payload.get("gid",""); username = request.state.user.username
+    groups = _load_groups()
+    if gid not in groups or username not in groups[gid].get("members", []): return imr
+    groups[gid]["members"] = [m for m in groups[gid]["members"] if m != username]
+    if not groups[gid]["members"]:
+        groups.pop(gid)
+        _db_path(gid).unlink(missing_ok=True)
+    _save_groups(groups)
+    if await ENV["get_state"](request, scope="user", namespace="finance", key="default_group") == gid:
+        await ENV["clear_state"](request, scope="user", namespace="finance", key="default_group")
+    remaining = _user_groups(username)
+    new_gid = remaining[0]["id"] if remaining else _ensure_personal_group(username)
+    await ENV["set_state"](request, new_gid, scope="user", namespace="finance", key="active_group")
+    return imr.raw(_panel_settings(request, new_gid))
 
 def _panel_breakdown(gid):
     conn = _conn(gid)
@@ -661,16 +765,36 @@ def _wage_period_bounds(rec: dict, pay_date: date) -> tuple:
         return prev_month.replace(day=min(rec["day2"] or 15, prev_last)) + timedelta(days=1), pay_date
     return pay_date.replace(day=d1) + timedelta(days=1), pay_date
 
+def _pending_html(gid: str) -> str:
+    conn = _conn(gid)
+    rows = [dict(r) for r in conn.execute("SELECT * FROM entries WHERE confirmed=0 ORDER BY date")]
+    conn.close()
+    if not rows: return '<div class="dim tiny" style="padding:.4rem 0">No pending bills.</div>'
+    today = date.today()
+    out = ""
+    for e in rows:
+        overdue = date.fromisoformat(e["date"]) < today
+        out += f"""<div class="glass" style="padding:.5rem .7rem;margin-bottom:.3rem;display:flex;align-items:center;gap:.5rem">
+                       <span style="flex:1">{_esc(e["label"])} <span class="dim tiny">{'OVERDUE - was due' if overdue else 'due'} {e["date"]}</span></span>
+                       <b style="color:{'#ff5f5f' if overdue else 'var(--text)'}">{_money(e["amount"])}</b>
+                       <button class="cm-qbtn" hx-post="/im/in" hx-target="#finance-panel" hx-swap="innerHTML" hx-vals='{{"type":"finance_pending_pay_now","lvl":1,"id":"{e["id"]}"}}'>Pay Now</button>
+                       <button class="cm-qbtn" hx-post="/im/in" hx-target="#finance-panel" hx-swap="innerHTML" hx-vals='{{"type":"finance_pending_mark_paid","lvl":1,"id":"{e["id"]}"}}'>Mark Paid</button>
+                   </div>"""
+    return out
+
 # --- Routes ---
 
 @router.get("/", response_class=HTMLResponse)
-async def index(request: Request):
+async def index(request: Request, join_group: str = ""):
+    if join_group:
+        groups = _load_groups()
+        if join_group in groups and request.state.user.username in groups[join_group].get("members", []):
+            await ENV["set_state"](request, join_group, scope="user", namespace="finance", key="active_group")
     gid = await _active_group(request)
     state = await TM._load(request)
     state, panel_html = await _render_panel(request, state)
     tab_bar = await TM.tab_bar_fn(state, "fin-tab-bar", "finance", 1, allow_new=False, closable=False)
-    return ENV["templates"].TemplateResponse(name="base.html", request=request, context={
-        "request": request, "user": request.state.user, "nesting_level": 1, "shell_id": IM.branch_id,
+    return ENV["templates"].TemplateResponse(name="base.html", request=request, context={"request": request, "user": request.state.user, "nesting_level": 1, "shell_id": IM.branch_id,
         "toolbars": {"top": UI.toolbar(side="top", content=tab_bar, size="2.5rem", id="fin-top", nesting_level=1, start_open=True, locked=True)},
         "content": f'<div id="finance-panel" style="height:100%;overflow:hidden">{panel_html}</div>', "extra_css": CSS})
 
