@@ -6,7 +6,7 @@ directly readable by an external widget app with no server involvement.
 Liquid cash and debt are tracked separately and never netted automatically - the goal is
 two numbers a person can hold in their head, not a single misleading net-worth figure.
 """
-import json, uuid, sqlite3, calendar, asyncio
+import io, re, csv, json, uuid, sqlite3, calendar, asyncio
 from pathlib import Path
 from datetime import date, timedelta, datetime
 from sqlalchemy import text
@@ -23,7 +23,6 @@ HORIZON_DAYS = 120
 
 ENV = {}
 UI = BI = IM = TM = None
-_NOTIFY_TASK = None
 
 def _esc(s): return str(s).replace("&","&amp;").replace("<","&lt;").replace(">","&gt;").replace('"',"&quot;")
 def _money(v): return f"${v:,.2f}" if v >= 0 else f"-${abs(v):,.2f}"
@@ -74,6 +73,8 @@ def _conn(gid: str) -> sqlite3.Connection:
     c.execute("CREATE TABLE IF NOT EXISTS recurring (id TEXT PRIMARY KEY, label TEXT, kind TEXT, account_id TEXT, to_account_id TEXT, amount REAL, is_estimate INTEGER, frequency TEXT, anchor_date TEXT, day1 INTEGER, day2 INTEGER, notify INTEGER, notify_days_before INTEGER, category TEXT, active INTEGER, last_notified_date TEXT, auto_pay INTEGER)")
     c.execute("CREATE TABLE IF NOT EXISTS entries (id TEXT PRIMARY KEY, account_id TEXT, date TEXT, label TEXT, amount REAL, category TEXT, projected INTEGER, recurring_id TEXT, linked_entry_id TEXT, confirmed INTEGER)")
     c.execute("CREATE TABLE IF NOT EXISTS exceptions (recurring_id TEXT, date TEXT, PRIMARY KEY(recurring_id, date))")
+    c.execute("CREATE TABLE IF NOT EXISTS notes (id TEXT PRIMARY KEY, date TEXT, text TEXT, author TEXT, t TEXT)")
+    c.execute("CREATE TABLE IF NOT EXISTS imports (id TEXT PRIMARY KEY, t TEXT, kind TEXT, label TEXT, ids TEXT)")
     for col, t in (("credit_limit","REAL"), ("apr","REAL")): _ensure_column(c, "accounts", col, t)
     _ensure_column(c, "recurring", "auto_pay", "INTEGER")
     _ensure_column(c, "recurring", "hourly_rate", "REAL")
@@ -161,15 +162,29 @@ def _materialize(gid: str, horizon_days: int = HORIZON_DAYS):
 
 # --- Balance calculation ---
 
+def _in_balance(e, asof: str, auto: set) -> bool:
+    """An auto-pay occurrence dated on or before the account's entered balance date is already in that balance (the bank took it), so it is not counted again."""
+    return bool(e["projected"] and e["recurring_id"] in auto and e["date"] <= (asof or ""))
+
 def _balances_at(gid: str, target: date) -> dict:
-    conn = _conn(gid); out = {}
+    """Each account on target: the balance you entered (as of its date), plus confirmed entries after that date up to target; from today on also the unconfirmed ones dated up to target
+    (bills not marked paid - overdue ones included - and projected occurrences), so each future day shows what the plan leaves on that day."""
+    conn, out, t = _conn(gid), {}, target.isoformat()
+    auto = {r["id"] for r in conn.execute("SELECT id FROM recurring WHERE auto_pay=1")}
     for a in [dict(r) for r in conn.execute("SELECT * FROM accounts")]:
-        asof = date.fromisoformat(a["asof"]) if a.get("asof") else target
-        confirmed_delta = conn.execute("SELECT COALESCE(SUM(amount),0) s FROM entries WHERE account_id=? AND confirmed=1 AND date>? AND date<=?", (a["id"], asof.isoformat(), target.isoformat())).fetchone()["s"]
-        pending_delta = conn.execute("SELECT COALESCE(SUM(amount),0) s FROM entries WHERE account_id=? AND confirmed=0", (a["id"],)).fetchone()["s"] if target >= date.today() else 0.0
+        asof = a["asof"] or t
+        confirmed_delta = conn.execute("SELECT COALESCE(SUM(amount),0) s FROM entries WHERE account_id=? AND confirmed=1 AND date>? AND date<=?", (a["id"], asof, t)).fetchone()["s"]
+        pending_delta = sum(e["amount"] for e in conn.execute("SELECT amount, date, projected, recurring_id FROM entries WHERE account_id=? AND confirmed=0 AND date<=?", (a["id"], t)) if not _in_balance(e, asof, auto)) if target >= date.today() else 0.0
         out[a["id"]] = {**a, "balance": a["balance"] + confirmed_delta + pending_delta, "is_liquid": bool(a["is_liquid"])}
     conn.close()
     return out
+
+def _settled_liquid(gid: str) -> float:
+    """Liquid money as the accounts stand today: entered balances plus confirmed entries since their dates - nothing still due is taken off (Upcoming does that, row by row)."""
+    conn, t = _conn(gid), date.today().isoformat()
+    total = sum(a["balance"] + conn.execute("SELECT COALESCE(SUM(amount),0) s FROM entries WHERE account_id=? AND confirmed=1 AND date>? AND date<=?", (a["id"], a["asof"] or t, t)).fetchone()["s"] for a in conn.execute("SELECT * FROM accounts WHERE is_liquid=1").fetchall())
+    conn.close()
+    return total
 
 
 def _liquid_total(balances: dict) -> float: return sum(v["balance"] for v in balances.values() if v["is_liquid"])
@@ -187,12 +202,13 @@ def _extended_grid(gid: str, center_year: int, center_month: int) -> list:
     grid_start = center_start - timedelta(days=28)
     grid_end = grid_start + timedelta(days=62)
     entries = conn.execute("SELECT * FROM entries WHERE date>=? AND date<=? ORDER BY date", (grid_start.isoformat(), grid_end.isoformat())).fetchall()
+    noted = {r["date"] for r in conn.execute("SELECT DISTINCT date FROM notes WHERE date>=? AND date<=?", (grid_start.isoformat(), grid_end.isoformat()))}
     conn.close()
     by_day = {}
     for e in entries: by_day.setdefault(e["date"], []).append(dict(e))
     weeks, week, d = [], [], grid_start
     while d <= grid_end:
-        week.append({"date": d, "entries": by_day.get(d.isoformat(), []), "liquid": _liquid_total(_balances_at(gid, d)), "in_month": d.month == center_month and d.year == center_year})
+        week.append({"date": d, "entries": by_day.get(d.isoformat(), []), "liquid": _liquid_total(_balances_at(gid, d)), "in_month": d.month == center_month and d.year == center_year, "noted": d.isoformat() in noted})
         if len(week) == 7: weeks.append(week); week = []
         d += timedelta(days=1)
     return weeks
@@ -204,7 +220,7 @@ def _day_cell_html(cell, gid) -> str:
     more_labels = "; ".join(f"{e['label']} {_money(e['amount'])}" for e in entries[3:])
     more = f'<div class="dim tiny" title="{_esc(more_labels)}">+{len(entries)-3} more</div>' if len(entries) > 3 else ""
     return f"""<div class="{cls}" hx-post="/im/in" hx-target="body" hx-swap="none" hx-vals='{json.dumps({"type":"finance_day_open","lvl":1,"date":d.isoformat()})}'>
-                   <div class="fin-day-num">{d.day}</div>{rows}{more}
+                   <div class="fin-day-num">{d.day}{' <span class="dim tiny">&#x1F4DD;</span>' if cell["noted"] else ""}</div>{rows}{more}
                    <div class="fin-day-liquid" style="color:{'#00ffa2' if liquid>=0 else '#ff5f5f'}">{_money(liquid)}</div>
                </div>"""
 
@@ -246,7 +262,9 @@ def _day_detail_html(gid: str, d: date) -> str:
                         <button type="submit" class="btn-icon" title="Save and confirm">&#x2713;</button>
                         <button type="button" class="btn-icon" style="color:#ff5f5f" hx-post="/im/in" hx-target="body" hx-swap="none" hx-vals='{json.dumps({"type":"finance_entry_delete","lvl":1,"id":e["id"]})}' title="{del_title}">&#x2715;</button>
                     </form>"""
-    return UI.modal("fin-day", d.strftime("%A, %B %d, %Y"), rows or '<div class="dim">Nothing scheduled this day.</div>')
+    notes = "".join(f"""<div class="list-row row"><span class="grow pre-wrap">{_esc(n["text"])}</span><span class="dim tiny">{_esc(n["author"])} {n["t"][5:16].replace("T", " ")}</span><button type="button" class="btn-icon" style="color:#ff5f5f" {_vals("note_delete", id=n["id"], date=d.isoformat())} hx-confirm="Delete this note?">&#x2715;</button></div>""" for n in _notes(gid, d.isoformat()))
+    add = f"""<form hx-post="/im/in" hx-target="body" hx-swap="none" hx-include="this" class="row" style="margin-top:.4rem"><input type="hidden" name="type" value="finance_note_add"><input type="hidden" name="lvl" value="1"><input type="hidden" name="date" value="{d.isoformat()}"><input name="text" class="module-select grow" placeholder="Note for this day (anything: what it was for, who to call, a reminder)" required><button type="submit" class="btn-icon" title="Add note">+</button></form>"""
+    return UI.modal("fin-day", d.strftime("%A, %B %d, %Y"), (rows or '<div class="dim">Nothing scheduled this day.</div>') + f"""<div class="fsect-hd" style="margin-top:.6rem">Notes</div>{notes}{add}""")
 
 # --- Quick add / correction ---
 
@@ -254,6 +272,7 @@ def _quick_add_html(gid: str) -> str:
     accounts = _accounts(gid)
     opts = "".join(f'<option value="{a["id"]}">{_esc(a["label"])}</option>' for a in accounts)
     return f"""<form hx-post="/im/in" hx-target="body" hx-swap="none" hx-include="this" style="display:flex;flex-direction:column;gap:.4rem">
+                   <input type="hidden" name="type" value="finance_quick_add"><input type="hidden" name="lvl" value="1">
                    <div style="display:flex;gap:.4rem">
                        <input type="number" name="amount" step="0.01" min="0" placeholder="$ per unit" class="module-select" style="flex:1" required>
                        <input type="number" name="qty" step="any" min="0" value="1" placeholder="x qty" class="module-select" style="width:5rem">
@@ -262,7 +281,6 @@ def _quick_add_html(gid: str) -> str:
                    <select name="kind" class="module-select"><option value="expense">Expense</option><option value="income">Income</option></select>
                    <select name="account_id" class="module-select">{opts or '<option value="">Add an account first</option>'}</select>
                    <input type="text" name="label" placeholder="e.g. Groceries, Gas" class="module-select" required>
-                   <input type="number" name="amount" step="0.01" min="0" placeholder="Amount" class="module-select" required>
                    <input type="date" name="date" value="{date.today().isoformat()}" class="module-select">
                    <button type="submit" class="button">Add</button>
                </form>"""
@@ -376,13 +394,16 @@ async def _panel_calendar(request, gid):
     ym = await ENV["get_state"](request, scope="user", namespace="finance", key="cal_ym") or {"y": today.year, "m": today.month}
     return f"""<div style="padding:.9rem;height:100%;overflow-y:auto;box-sizing:border-box">
                    {_calendar_html(gid, ym["y"], ym["m"])}
-                   <div class="fsect-hd">Pending Bills</div>{_pending_html(gid)}
+                   <div class="fsect-hd">Pending Bills</div><div id="fin-pending">{_pending_html(gid)}</div>
                    <div class="fsect-hd" style="margin-top:1rem">Quick Add</div>
                    {_quick_add_html(gid)}
                    <div class="fsect-hd" style="margin-top:1rem">Correct a Balance</div>
                    <p class="dim tiny">Set what an account actually has right now - everything projected forward recalculates from this point. No need to find and fix individual past entries.</p>
                    {_correction_html(gid)}
                </div>"""
+
+def _panel_upcoming(gid, days): return f'<div style="padding:.9rem;height:100%;overflow-y:auto;box-sizing:border-box"><div id="fin-upcoming">{_upcoming_html(gid, days)}</div></div>'
+def _panel_import(gid): return f'<div style="padding:.9rem;height:100%;overflow-y:auto;box-sizing:border-box"><div id="fin-import">{_import_html(gid)}</div></div>'
 
 def _panel_accounts(gid): return f'<div style="padding:.9rem;height:100%;overflow-y:auto;box-sizing:border-box">{_accounts_list_html(gid)}<div class="fsect-hd" style="margin-top:1rem">Add / Edit Account</div><div id="fin-account-form">{_account_form_html()}</div></div>'
 def _panel_recurring(gid): return f'<div style="padding:.9rem;height:100%;overflow-y:auto;box-sizing:border-box">{_recurring_list_html(gid)}<div class="fsect-hd" style="margin-top:1rem">Add / Edit Recurring Item</div><div id="fin-recurring-form">{_recurring_form_html(gid)}</div></div>'
@@ -428,6 +449,9 @@ async def _render_panel(request, state):
     if active == "recurring": return state, _panel_recurring(gid)
     if active == "settings": return state, _panel_settings(request, gid)
     if active == "breakdown": return state, _panel_breakdown(gid)
+    if active == "upcoming": return state, _panel_upcoming(gid, await _up_days(request))
+    if active == "plan": return state, _panel_plan(gid, await _plan_days(request))
+    if active == "import": return state, _panel_import(gid)
     return state, await _panel_calendar(request, gid)
 
 # --- Notification loop ---
@@ -461,10 +485,6 @@ async def _notify_loop():
         except Exception as e: print(f"[finance] notify loop error: {e}")
         await asyncio.sleep(3600)
 
-def _ensure_notify_task():
-    global _NOTIFY_TASK
-    if _NOTIFY_TASK is None or _NOTIFY_TASK.done(): _NOTIFY_TASK = asyncio.create_task(_notify_loop())
-
 # --- Init ---
 
 def init_module(env: dict):
@@ -474,7 +494,7 @@ def init_module(env: dict):
     BI = ENV["tools"]["built_ins"]
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     IM = ENV["InterfaceManager"](nesting_level=1, db_path="finance_im.db")
-    TM = BI.TabManager(namespace="finance", tab_bar_id="fin-tab-bar", content_id="finance-panel", render_content_fn=_render_panel, intent_prefix="finance", IM=IM, scope="user", nesting_level=1, allow_new=False, closable=False, empty={"tabs": {"calendar":{"id":"calendar","order":0,"label":"Calendar","icon":"&#x1F4C5;"}, "accounts":{"id":"accounts","order":1,"label":"Accounts","icon":"&#x1F3E6;"}, "breakdown":{"id":"breakdown","order":2,"label":"Breakdown","icon":"&#x1F4CA;"}, "recurring":{"id":"recurring","order":3,"label":"Recurring","icon":"&#x1F501;"}, "settings":{"id":"settings","order":4,"label":"Settings","icon":"&#x2699;"}}, "active":"calendar"})
+    TM = BI.TabManager(namespace="finance", tab_bar_id="fin-tab-bar", content_id="finance-panel", render_content_fn=_render_panel, intent_prefix="finance", IM=IM, scope="user", nesting_level=1, allow_new=False, closable=False, empty={"tabs": {"calendar":{"id":"calendar","order":0,"label":"Calendar","icon":"&#x1F4C5;"}, "upcoming":{"id":"upcoming","order":0.5,"label":"Upcoming","icon":"&#x1F4CB;"}, "plan":{"id":"plan","order":0.7,"label":"Plan","icon":"&#x1F4C8;"}, "accounts":{"id":"accounts","order":1,"label":"Accounts","icon":"&#x1F3E6;"}, "breakdown":{"id":"breakdown","order":2,"label":"Breakdown","icon":"&#x1F4CA;"}, "recurring":{"id":"recurring","order":3,"label":"Recurring","icon":"&#x1F501;"}, "import":{"id":"import","order":3.5,"label":"Import","icon":"&#x1F4E5;"}, "settings":{"id":"settings","order":4,"label":"Settings","icon":"&#x2699;"}}, "active":"calendar"})
     IM.scripts.update({
         "finance_calendar_nav": [_h_calendar_nav], "finance_day_open": [_h_day_open],
         "finance_quick_add": [_h_quick_add], "finance_correction": [_h_correction],
@@ -483,8 +503,12 @@ def init_module(env: dict):
         "finance_recurring_form": [_h_recurring_form], "finance_recurring_save": [_h_recurring_save], "finance_recurring_delete": [_h_recurring_delete],
         "finance_pending_pay_now": [_h_pending_pay_now], "finance_pending_mark_paid": [_h_pending_mark_paid],
         "finance_group_create": [_h_group_create], "finance_group_set_default": [_h_group_set_default], "finance_group_leave": [_h_group_leave],
-        "finance_group_switch": [_h_group_switch], "finance_group_members_save": [_h_group_members_save], "finance_threshold_save": [_h_threshold_save]})
-    _ensure_notify_task()
+        "finance_group_switch": [_h_group_switch], "finance_group_members_save": [_h_group_members_save], "finance_threshold_save": [_h_threshold_save],
+        "finance_note_add": [_h_note_add], "finance_note_delete": [_h_note_delete], "finance_upcoming_days": [_h_upcoming_days], "finance_up_paid": [_h_up_paid], "finance_up_skip": [_h_up_skip],
+        "finance_import_read": [_h_import_read], "finance_import_go": [_h_import_go], "finance_import_undo": [_h_import_undo],
+        "finance_plan_days": [_h_plan_days], "finance_plan_whatif": [_h_plan_whatif], "finance_plan_add": [_h_plan_add]})
+    ENV["register_service"]("finance", {"due_items": due_items, "command": {"help": _CMD_HELP, "parse": _cmd_parse, "run": _cmd_run, "aliases": ["fin"]}})   # Muninn's Today (and any summary view) lists bills that need you; @finance lines in Muninn captures add entries
+    ENV["register_startup"](_notify_loop)   # init runs before the server's event loop exists; the loop starts with the server
     print("[finance] ready")
 
 # --- Intent handlers ---
@@ -492,6 +516,7 @@ def init_module(env: dict):
 async def _refresh_calendar(request, gid, imr):
     ym = await ENV["get_state"](request, scope="user", namespace="finance", key="cal_ym") or {"y": date.today().year, "m": date.today().month}
     imr.oob(_calendar_html(gid, ym["y"], ym["m"]), "fin-calendar", swap="outerHTML")
+    imr.oob(_upcoming_html(gid, await _up_days(request)), "fin-upcoming")
 
 async def _h_calendar_nav(request, payload, imr):
     await ENV["set_state"](request, {"y": int(payload.get("year")), "m": int(payload.get("month"))}, scope="user", namespace="finance", key="cal_ym")
@@ -501,18 +526,7 @@ async def _h_calendar_nav(request, payload, imr):
 
 async def _h_day_open(request, payload, imr):
     gid = await _active_group(request)
-    imr.raw(_day_detail_html(gid, date.fromisoformat(payload.get("date"))))
-    return imr
-
-async def _h_quick_add(request, payload, imr):
-    gid = await _active_group(request)
-    sign = 1 if payload.get("kind") == "income" else -1
-    amt = float(payload.get("amount",0) or 0) * float(payload.get("qty",1) or 1)
-    confirmed = 0 if payload.get("pending") == "1" else 1
-    conn = _conn(gid)
-    conn.execute("INSERT INTO entries VALUES (?,?,?,?,?,?,?,?,?,?)", (uuid.uuid4().hex[:10], payload.get("account_id",""), payload.get("date", date.today().isoformat()), payload.get("label","").strip(), sign*abs(amt), "", 0, None, None, confirmed))
-    conn.commit(); conn.close()
-    await _refresh_calendar(request, gid, imr)
+    imr.oob(_day_detail_html(gid, date.fromisoformat(payload.get("date"))), "fin-modal")
     return imr
 
 async def _h_correction(request, payload, imr):
@@ -532,7 +546,7 @@ async def _h_entry_save(request, payload, imr):
     conn.execute("UPDATE entries SET label=?, amount=?, confirmed=1 WHERE id=?", (payload.get("label","").strip(), float(payload.get("amount",0) or 0), eid))
     conn.commit(); conn.close()
     e = _entry(gid, eid)
-    if e: imr.raw(_day_detail_html(gid, date.fromisoformat(e["date"])))
+    if e: imr.oob(_day_detail_html(gid, date.fromisoformat(e["date"])), "fin-modal")
     await _refresh_calendar(request, gid, imr)
     return imr
 
@@ -547,7 +561,7 @@ async def _h_entry_delete(request, payload, imr):
     conn.execute("DELETE FROM entries WHERE id=?", (eid,))
     if e["linked_entry_id"]: conn.execute("DELETE FROM entries WHERE id=?", (e["linked_entry_id"],))
     conn.commit(); conn.close()
-    imr.raw(_day_detail_html(gid, date.fromisoformat(e["date"])))
+    imr.oob(_day_detail_html(gid, date.fromisoformat(e["date"])), "fin-modal")
     await _refresh_calendar(request, gid, imr)
     return imr
 
@@ -655,16 +669,16 @@ async def _h_threshold_save(request, payload, imr):
         _save_groups(groups)
     return imr
 
-# _h_quick_add - multiply before signing
 async def _h_quick_add(request, payload, imr):
+    """amount x qty, signed by kind; "Not paid yet" adds it as a pending bill (unconfirmed) instead of money already spent."""
     gid = await _active_group(request)
     sign = 1 if payload.get("kind") == "income" else -1
     amt = float(payload.get("amount",0) or 0) * float(payload.get("qty",1) or 1)
     conn = _conn(gid)
-    conn.execute("INSERT INTO entries VALUES (?,?,?,?,?,?,?,?,?,?)", (uuid.uuid4().hex[:10], payload.get("account_id",""), payload.get("date", date.today().isoformat()), payload.get("label","").strip(), sign*abs(amt), "", 0, None, None, 1))
+    conn.execute("INSERT INTO entries VALUES (?,?,?,?,?,?,?,?,?,?)", (uuid.uuid4().hex[:10], payload.get("account_id",""), payload.get("date", date.today().isoformat()), payload.get("label","").strip(), sign*abs(amt), "", 0, None, None, 0 if payload.get("pending") == "1" else 1))
     conn.commit(); conn.close()
     await _refresh_calendar(request, gid, imr)
-    return imr
+    return imr.oob(_pending_html(gid), "fin-pending")
 
 async def _h_pending_pay_now(request, payload, imr):
     """Money leaves today, regardless of the bill's original due date."""
@@ -673,7 +687,7 @@ async def _h_pending_pay_now(request, payload, imr):
     conn.execute("UPDATE entries SET date=?, confirmed=1 WHERE id=?", (date.today().isoformat(), payload.get("id","")))
     conn.commit(); conn.close()
     await _refresh_calendar(request, gid, imr)
-    return imr
+    return imr.oob(_pending_html(gid), "fin-pending")
 
 async def _h_pending_mark_paid(request, payload, imr):
     """Already handled elsewhere (e.g. autopay) - stop reserving against it, but don't touch today's actual liquid; keeps its original date so normal accounting picks it up on/after that date."""
@@ -682,7 +696,7 @@ async def _h_pending_mark_paid(request, payload, imr):
     conn.execute("UPDATE entries SET confirmed=1 WHERE id=?", (payload.get("id",""),))
     conn.commit(); conn.close()
     await _refresh_calendar(request, gid, imr)
-    return imr
+    return imr.oob(_pending_html(gid), "fin-pending")
 
 async def _h_group_create(request, payload, imr):
     name = (payload.get("label") or "").strip()
@@ -777,10 +791,409 @@ def _pending_html(gid: str) -> str:
         out += f"""<div class="glass" style="padding:.5rem .7rem;margin-bottom:.3rem;display:flex;align-items:center;gap:.5rem">
                        <span style="flex:1">{_esc(e["label"])} <span class="dim tiny">{'OVERDUE - was due' if overdue else 'due'} {e["date"]}</span></span>
                        <b style="color:{'#ff5f5f' if overdue else 'var(--text)'}">{_money(e["amount"])}</b>
-                       <button class="cm-qbtn" hx-post="/im/in" hx-target="#finance-panel" hx-swap="innerHTML" hx-vals='{{"type":"finance_pending_pay_now","lvl":1,"id":"{e["id"]}"}}'>Pay Now</button>
-                       <button class="cm-qbtn" hx-post="/im/in" hx-target="#finance-panel" hx-swap="innerHTML" hx-vals='{{"type":"finance_pending_mark_paid","lvl":1,"id":"{e["id"]}"}}'>Mark Paid</button>
+                       <button class="cm-qbtn" hx-post="/im/in" hx-target="body" hx-swap="none" hx-vals='{{"type":"finance_pending_pay_now","lvl":1,"id":"{e["id"]}"}}'>Pay Now</button>
+                       <button class="cm-qbtn" hx-post="/im/in" hx-target="body" hx-swap="none" hx-vals='{{"type":"finance_pending_mark_paid","lvl":1,"id":"{e["id"]}"}}'>Mark Paid</button>
                    </div>"""
     return out
+
+# --- Notes: free text on any day (the day view lists them; the calendar and Upcoming mark the day) ---
+
+def _vals(action: str, **kw) -> str: return f"""hx-post="/im/in" hx-target="body" hx-swap="none" hx-vals='{json.dumps({"type": f"finance_{action}", "lvl": 1, **kw})}'"""
+
+def _notes(gid: str, day: str) -> list:
+    conn = _conn(gid)
+    rows = [dict(r) for r in conn.execute("SELECT * FROM notes WHERE date=? ORDER BY t", (day,))]
+    conn.close()
+    return rows
+
+async def _h_note_add(request, payload, imr):
+    gid, d = await _active_group(request), payload.get("date", date.today().isoformat())
+    conn = _conn(gid)
+    conn.execute("INSERT INTO notes VALUES (?,?,?,?,?)", (uuid.uuid4().hex[:10], d, payload.get("text", "").strip(), request.state.user.username, datetime.now().isoformat(timespec="seconds")))
+    conn.commit()
+    conn.close()
+    imr.oob(_day_detail_html(gid, date.fromisoformat(d)), "fin-modal")
+    await _refresh_calendar(request, gid, imr)
+    return imr
+
+async def _h_note_delete(request, payload, imr):
+    gid = await _active_group(request)
+    conn = _conn(gid)
+    conn.execute("DELETE FROM notes WHERE id=?", (payload.get("id", ""),))
+    conn.commit()
+    conn.close()
+    imr.oob(_day_detail_html(gid, date.fromisoformat(payload["date"])), "fin-modal")
+    await _refresh_calendar(request, gid, imr)
+    return imr
+
+# --- Upcoming: what is due and coming, in date order, with the balance after each - and what is really available now ---
+
+async def _up_days(request) -> int: return int(await ENV["get_state"](request, scope="user", namespace="finance", key="up_days") or 31)
+
+def _upcoming(gid: str, days: int) -> dict:
+    """Unconfirmed entries (bills not marked paid, projected occurrences, income not yet in) up to today + days, oldest first, so overdue ones lead; rows on liquid accounts carry the liquid balance after them.
+    now = liquid money as the accounts stand today; available = now minus everything due up to and including the day of the next income, minus the group's low-balance buffer."""
+    _materialize(gid)
+    today, end = date.today().isoformat(), (date.today() + timedelta(days=days)).isoformat()
+    conn = _conn(gid)
+    rows = [dict(r) for r in conn.execute("SELECT * FROM entries WHERE confirmed=0 AND date<=? ORDER BY date, amount", (end,))]
+    recs = {r["id"]: dict(r) for r in conn.execute("SELECT id, auto_pay, is_estimate FROM recurring")}
+    noted = {r["date"] for r in conn.execute("SELECT DISTINCT date FROM notes")}
+    conn.close()
+    accts, auto = _account_map(gid), {k for k, r in recs.items() if r["auto_pay"]}
+    run = now = _settled_liquid(gid)
+    for e in rows:
+        a, r = accts.get(e["account_id"], {}), recs.get(e["recurring_id"] or "", {})
+        e.update(account=a.get("label", "?"), liquid=bool(a.get("is_liquid")), auto=bool(r.get("auto_pay")), estimate=bool(r.get("is_estimate")), overdue=e["date"] < today, noted=e["date"] in noted, covered=_in_balance(e, a.get("asof"), auto))
+        if e["liquid"] and not e["covered"]: run += e["amount"]
+        e["after"] = run if e["liquid"] and not e["covered"] else None
+    live = [e for e in rows if e["after"] is not None]
+    nxt = next((e for e in live if e["amount"] > 0 and e["date"] >= today), None)
+    due = sum(e["amount"] for e in live if e["amount"] < 0 and (not nxt or e["date"] <= nxt["date"]))
+    buffer = _load_groups().get(gid, {}).get("low_balance_threshold", 100.0)
+    return {"rows": rows, "now": now, "next": nxt, "due": due, "buffer": buffer, "available": now + due - buffer, "low": min(live, key=lambda e: e["after"], default=None)}
+
+def _upcoming_row(e: dict, today: str) -> str:
+    when = f"""<span style="color:#ff5f5f">{e["date"][5:]} overdue</span>""" if e["overdue"] else f"""<b>{e["date"][5:]} today</b>""" if e["date"] == today else e["date"][5:]
+    tags = "".join(f"""<span class="chip">{t}</span>""" for t, on in (("auto", e["auto"]), ("~est", e["estimate"]), ("&#x1F4DD;", e["noted"]), ("in your balance", e["covered"]), ("not liquid", not e["liquid"])) if on)
+    pay_now = f"""<button class="btn-icon" title="Paying it now (leaves today)" {_vals("up_paid", id=e["id"], now=1)}>&#x1F4B5;</button>""" if e["amount"] < 0 else ""
+    skip = f"""<button class="btn-icon" title="Skip this occurrence (the rest of its schedule stays)" {_vals("up_skip", id=e["id"])}>&#x23ED;</button>""" if e["recurring_id"] else ""
+    return f"""<tr style="opacity:{.55 if e["after"] is None else 1}"><td style="cursor:pointer;white-space:nowrap" title="Open this day (notes, edits)" {_vals("day_open", date=e["date"])}>{when}</td><td>{_esc(e["label"])} {tags}</td><td class="dim tiny">{_esc(e["account"])}</td>
+               <td style="color:{"#00ffa2" if e["amount"] >= 0 else "#ff8c8c"}">{_money(e["amount"])}</td><td>{_money(e["after"]) if e["after"] is not None else ""}</td>
+               <td><div class="row" style="flex-wrap:nowrap;gap:.1rem"><button class="btn-icon" title="{"Paid" if e["amount"] < 0 else "Arrived"} (on its date; today if that has not come yet)" {_vals("up_paid", id=e["id"])}>&#x2713;</button>{pay_now}{skip}</div></td></tr>"""
+
+def _upcoming_html(gid: str, days: int) -> str:
+    u, today = _upcoming(gid, days), date.today().isoformat()
+    until = f"""before the next income ({_esc(u["next"]["label"])} {u["next"]["date"][5:]})""" if u["next"] else f"in the next {days} days (no income expected)"
+    low = f"""<span>Lowest ahead: <b style="color:{"#ff5f5f" if u["low"]["after"] < u["buffer"] else "inherit"}">{_money(u["low"]["after"])}</b> on {u["low"]["date"][5:]}</span>""" if u["low"] else ""
+    span = "".join(f"""<button class="chip"{' style="background:var(--accent);color:var(--bg)"' if n == days else ""} {_vals("upcoming_days", days=n)}>{n} days</button>""" for n in (14, 31, 62, 120))
+    return f"""<div class="info-bar row" style="justify-content:space-between"><span>Liquid now: <b>{_money(u["now"])}</b></span><span>Due {until}: <b style="color:#ff8c8c">{_money(-u["due"])}</b></span>
+                   <span>Available now: <b style="color:{"#00ffa2" if u["available"] >= 0 else "#ff5f5f"};font-size:1.25em">{_money(u["available"])}</b> <span class="dim tiny">after your {_money(u["buffer"])} buffer</span></span>{low}</div>
+               <div class="row" style="margin:.3rem 0"><span class="dim tiny grow">Not paid or not in yet, oldest first. Liquid now = the balances you entered plus confirmed entries after them (enter the bank's number after paying).</span>{span}</div>
+               <table class="data-table"><thead><tr><th>Date</th><th>Item</th><th>Account</th><th>Amount</th><th>Balance after</th><th></th></tr></thead><tbody>{"".join(_upcoming_row(e, today) for e in u["rows"]) or '<tr><td colspan="6" class="dim">Nothing due in this window.</td></tr>'}</tbody></table>"""
+
+async def _h_upcoming_days(request, payload, imr):
+    await ENV["set_state"](request, int(payload.get("days") or 31), scope="user", namespace="finance", key="up_days")
+    return imr.oob(_upcoming_html(await _active_group(request), int(payload.get("days") or 31)), "fin-upcoming")
+
+async def _h_up_paid(request, payload, imr):
+    """Paid (a bill) or arrived (income): on its own date when that has come, today when it was early; now=1 moves it to today (paying it now)."""
+    gid = await _active_group(request)
+    e = _entry(gid, payload.get("id", ""))
+    if not e: return imr
+    conn = _conn(gid)
+    conn.execute("UPDATE entries SET confirmed=1, date=? WHERE id=?", (date.today().isoformat() if payload.get("now") else min(e["date"], date.today().isoformat()), e["id"]))
+    conn.commit()
+    conn.close()
+    await _refresh_calendar(request, gid, imr)
+    return imr
+
+async def _h_up_skip(request, payload, imr):
+    """This occurrence will not happen: recorded as an exception so it is not projected again; the rest of the schedule stays."""
+    gid = await _active_group(request)
+    e = _entry(gid, payload.get("id", ""))
+    if not e or not e["recurring_id"]: return imr
+    conn = _conn(gid)
+    conn.execute("INSERT OR IGNORE INTO exceptions (recurring_id,date) VALUES (?,?)", (e["recurring_id"], e["date"]))
+    conn.execute("DELETE FROM entries WHERE id=? OR id=?", (e["id"], e["linked_entry_id"] or ""))
+    conn.commit()
+    conn.close()
+    await _refresh_calendar(request, gid, imr)
+    return imr
+
+# --- Plan: from one income to the next - what each one has to cover and what is left, the balance line ahead, and "what if I spend X on a day" (nothing is saved until you add it) ---
+
+async def _plan_days(request) -> int: return int(await ENV["get_state"](request, scope="user", namespace="finance", key="plan_days") or 62)
+
+def _plan(gid: str, days: int, extra: dict = None) -> dict:
+    """Upcoming's rows on liquid accounts (plus an optional what-if row), each with the liquid balance after it, split into periods at every income still to come.
+    A period: start (today, or the income's day), incomes, other rows, end (the liquid balance when it closes) and low (its lowest point). Overdue rows count from today."""
+    u, today = _upcoming(gid, days), date.today().isoformat()
+    rows = sorted([e for e in u["rows"] if e["after"] is not None] + ([extra] if extra else []), key=lambda e: (max(e["date"], today), e["amount"]))
+    run, periods = u["now"], [{"start": today, "incomes": [], "rows": [], "end": u["now"], "low": u["now"]}]
+    for e in rows:
+        run += e["amount"]
+        p = periods[-1]
+        if e["amount"] > 0 and e["date"] > today and not (p["start"] == e["date"] and not p["rows"]): periods.append(p := {"start": e["date"], "incomes": [], "rows": [], "end": run, "low": run})
+        (p["incomes"] if e["amount"] > 0 and e["date"] >= p["start"] and not p["rows"] else p["rows"]).append({**e, "after": run})
+        p["end"], p["low"] = run, min(p["low"], run)
+    nxt = next((e for e in rows if e["amount"] > 0 and e["date"] >= today), None)   # available now, as Upcoming counts it - with the what-if row
+    due = sum(e["amount"] for e in rows if e["amount"] < 0 and (not nxt or e["date"] <= nxt["date"]))
+    return {**u, "periods": periods, "points": [(today, u["now"])] + [(max(r["date"], today), r["after"]) for p in periods for r in p["incomes"] + p["rows"]], "low": min(periods, key=lambda p: p["low"]), "available": u["now"] + due - u["buffer"]}
+
+def _plan_chart(points: list, base: list, days: int, buffer: float, marks: list) -> str:
+    """The liquid balance as a step line from today over days (base: the line without the what-if row, drawn faint behind it), with the buffer dashed and zero marked.
+    marks: the days named under the line (the incomes). The drawing stretches to the width; its labels are page text placed on it, so they stay readable on a phone."""
+    d0 = date.today()
+    vals = [v for _, v in points + base] + [buffer, 0]
+    lo, hi = min(vals), max(vals)
+    pad = (hi - lo) * .08 or 50
+    lo, hi = lo - pad, hi + pad
+    x = lambda d: round(20 + (date.fromisoformat(d) - d0).days / max(days, 1) * 960, 1)
+    y = lambda v: round(4 + (hi - v) / (hi - lo) * 92, 1)
+    def line(pts): return f"""{x(pts[0][0])},{y(pts[0][1])} """ + " ".join(f"{x(d)},{y(v1)} {x(d)},{y(v2)}" for (_, v1), (d, v2) in zip(pts, pts[1:])) + f" 990,{y(pts[-1][1])}"
+    lbl = lambda left, top, text, style="": f"""<span class="fin-ch-lbl" style="left:{left / 10}%;top:{top}%;{style}">{text}</span>"""
+    low = min(points, key=lambda p: p[1])
+    ticks = "".join(lbl(x(d), 100, d[5:]) for d in marks[::max(1, len(marks) // 8)])
+    faint = f"""<polyline points="{line(base)}" vector-effect="non-scaling-stroke" style="fill:none;stroke:var(--text_muted);stroke-width:1;opacity:.6"/>""" if base != points else ""
+    return f"""<div class="fin-chart"><svg viewBox="0 0 1000 100" preserveAspectRatio="none" role="img" aria-label="Liquid balance ahead">
+                   <line x1="20" x2="990" y1="{y(buffer)}" y2="{y(buffer)}" vector-effect="non-scaling-stroke" style="stroke:#ffaa44;stroke-dasharray:4 3;stroke-width:1"/>
+                   <line x1="20" x2="990" y1="{y(0)}" y2="{y(0)}" vector-effect="non-scaling-stroke" style="stroke:var(--border);stroke-width:1"/>{faint}
+                   <polyline points="{line(points)}" vector-effect="non-scaling-stroke" style="fill:none;stroke:var(--accent);stroke-width:2"/></svg>
+               {lbl(990, y(buffer), f"buffer {_money(buffer)}", "transform:translate(-100%,-110%);color:#ffaa44")}{lbl(20, 0, _money(hi - pad)[:-3], "transform:translate(0,-100%)")}
+               <span class="fin-ch-dot" style="left:{x(low[0]) / 10}%;top:{y(low[1])}%;background:{"#ff5f5f" if low[1] < buffer else "var(--accent)"}"></span>{lbl(x(low[0]), y(low[1]), _money(low[1]), "transform:translate(-50%,40%);color:var(--text)")}{ticks}</div>"""
+
+def _plan_period(p: dict, nxt: str, buffer: float) -> str:
+    chip = lambda e: f"""<span class="chip" title="{e["date"]}{" - what if" if e.get("whatif") else ""}" style="{"font-style:italic;border-color:var(--accent)" if e.get("whatif") else ""}">{_esc(e["label"])} {_money(e["amount"])} <span class="dim">{e["date"][5:]}</span></span>"""
+    span = f"""{"Today" if not p["incomes"] else date.fromisoformat(p["start"]).strftime("%a %m-%d")} &#x2192; {date.fromisoformat(nxt).strftime("%a %m-%d") if nxt else "end of view"}"""
+    bills = sum(e["amount"] for e in p["rows"])
+    return f"""<tr><td style="white-space:nowrap">{span}</td><td>{"".join(chip(e) for e in p["incomes"]) or '<span class="dim">-</span>'}</td><td>{"".join(chip(e) for e in p["rows"]) or '<span class="dim">nothing due</span>'}</td>
+               <td style="color:#ff8c8c;white-space:nowrap">{_money(bills)}</td><td style="white-space:nowrap"><b style="color:{"#ff5f5f" if p["end"] < buffer else "inherit"}">{_money(p["end"])}</b></td><td style="white-space:nowrap;color:{"#ff5f5f" if p["low"] < buffer else "inherit"}">{_money(p["low"])}</td></tr>"""
+
+def _plan_html(gid: str, days: int, w: dict = None) -> str:
+    """w: a what-if spend (amount, date, label) shown on top of the plan; Add puts it in as a bill not paid yet."""
+    extra = {"id": "", "label": (w.get("label") or "what if").strip(), "amount": -abs(float(w["amount"])), "date": w.get("date") or date.today().isoformat(), "whatif": True} if w and _num(str(w.get("amount", ""))) else None
+    base, pl = _plan(gid, days), _plan(gid, days, extra)
+    ps, bf = pl["periods"], pl["buffer"]
+    rows = "".join(_plan_period(p, ps[i + 1]["start"] if i + 1 < len(ps) else "", bf) for i, p in enumerate(ps))
+    span = "".join(f"""<button class="chip"{' style="background:var(--accent);color:var(--bg)"' if n == days else ""} {_vals("plan_days", days=n)}>{n} days</button>""" for n in (31, 62, 120))
+    diff = f"""<div class="info-bar">With &ldquo;{_esc(extra["label"])}&rdquo; ({_money(extra["amount"])} on {extra["date"][5:]}): available now <b>{_money(pl["available"])}</b> (was {_money(base["available"])}), lowest ahead <b style="color:{"#ff5f5f" if pl["low"]["low"] < bf else "inherit"}">{_money(pl["low"]["low"])}</b> (was {_money(base["low"]["low"])}){" - below your buffer" if pl["low"]["low"] < bf else ""}.
+               <button class="ui-btn" {_vals("plan_add", amount=-extra["amount"], date=extra["date"], label=extra["label"])}>Add it as a bill (not paid yet)</button><button class="ui-btn" {_vals("plan_whatif")}>Clear</button></div>""" if extra else ""
+    form = f"""<form class="row" {_vals("plan_whatif")} hx-include="this"><span class="dim tiny">What if I spend</span><input type="number" name="amount" step="0.01" min="0" class="module-select" style="width:7rem" value="{-extra["amount"] if extra else ""}" required>
+               <span class="dim tiny">on</span><input type="date" name="date" class="module-select" value="{extra["date"] if extra else date.today().isoformat()}"><input name="label" class="module-select" placeholder="for what" value="{_esc(extra["label"]) if extra else ""}"><button type="submit" class="ui-btn">Show</button></form>"""
+    return f"""<div class="info-bar row" style="justify-content:space-between"><span>Liquid now: <b>{_money(pl["now"])}</b></span><span>Available now: <b style="color:{"#00ffa2" if pl["available"] >= 0 else "#ff5f5f"}">{_money(pl["available"])}</b></span>
+                   <span>Lowest ahead: <b style="color:{"#ff5f5f" if pl["low"]["low"] < bf else "inherit"}">{_money(pl["low"]["low"])}</b> in the period from {pl["low"]["start"][5:]}</span><span class="row">{span}</span></div>
+               {_plan_chart(pl["points"], base["points"], days, bf, [p["start"] for p in ps[1:]])}{form}{diff}
+               <div class="dim tiny" style="margin:.3rem 0">Each row runs from an income to the day before the next one: what that income has to cover, and what is left. Rows are the bills and income not marked paid or in yet (Upcoming), on liquid accounts.</div>
+               <div style="overflow-x:auto"><table class="data-table"><thead><tr><th>Period</th><th>Income</th><th>To pay in it</th><th>Total</th><th>Left at its end</th><th>Lowest</th></tr></thead><tbody>{rows}</tbody></table></div>"""
+
+def _panel_plan(gid, days): return f'<div style="padding:.9rem;height:100%;overflow-y:auto;box-sizing:border-box"><div id="fin-plan">{_plan_html(gid, days)}</div></div>'
+
+async def _h_plan_days(request, payload, imr):
+    await ENV["set_state"](request, int(payload.get("days") or 62), scope="user", namespace="finance", key="plan_days")
+    return imr.oob(_plan_html(await _active_group(request), int(payload.get("days") or 62)), "fin-plan")
+
+async def _h_plan_whatif(request, payload, imr): return imr.oob(_plan_html(await _active_group(request), await _plan_days(request), payload if payload.get("amount") else None), "fin-plan")
+
+async def _h_plan_add(request, payload, imr):
+    """The what-if spend becomes a bill not paid yet on the first liquid account (change it in that day's view)."""
+    gid = await _active_group(request)
+    acct = next((a for a in _accounts(gid) if a["is_liquid"]), None)
+    if not acct: return imr.oob('<div class="err-box">Add a liquid account first (Accounts).</div>' + _plan_html(gid, await _plan_days(request)), "fin-plan")
+    conn = _conn(gid)
+    conn.execute("INSERT INTO entries VALUES (?,?,?,?,?,?,?,?,?,?)", (uuid.uuid4().hex[:10], acct["id"], payload.get("date") or date.today().isoformat(), str(payload.get("label") or "what if").strip(), -abs(float(payload["amount"])), "", 0, None, None, 0))
+    conn.commit()
+    conn.close()
+    await _refresh_calendar(request, gid, imr)
+    return imr.oob(_plan_html(gid, await _plan_days(request)), "fin-plan")
+
+# --- Import: a sheet's rows (a CSV file, or cells copied from the sheet and pasted) as bills or transactions; you map the columns, see each row as it will be read, and can undo an import ---
+
+_IMPORT_FIELDS = {"bills": [("label", "Name", True), ("amount", "Amount", True), ("due", "Due day or date", True), ("frequency", "How often (monthly when empty)", False), ("kind", "Income / expense", False), ("category", "Category", False), ("auto", "Auto-pay (yes / no)", False)],
+                  "transactions": [("date", "Date", True), ("label", "Description", True), ("amount", "Amount", False), ("debit", "Debit (money out)", False), ("credit", "Credit (money in)", False), ("category", "Category", False), ("note", "Note (kept on that day)", False)]}
+_DATE_FORMATS = ("%Y-%m-%d", "%m/%d/%Y", "%m/%d/%y", "%m-%d-%Y", "%m-%d-%y", "%Y/%m/%d", "%b %d, %Y", "%B %d, %Y", "%b %d %Y", "%B %d %Y", "%d %b %Y", "%d %B %Y")
+
+def _sheet_rows(text: str) -> list:
+    """Rows of cells copied from a sheet (tab-separated) or of CSV text (comma, semicolon or bar)."""
+    sample = text[:4096]
+    try: delim = "\t" if "\t" in sample else csv.Sniffer().sniff(sample, delimiters=",;|").delimiter
+    except csv.Error: delim = ","
+    return [r for r in csv.reader(io.StringIO(text), delimiter=delim) if any(c.strip() for c in r)]
+
+def _num(s: str):
+    """$1,234.56 / -12 / (12.00) / 12- as a number (US style: comma = thousands); None when it is not one."""
+    t = re.sub(r"[\s$€£,]", "", s or "")
+    neg = (t.startswith("(") and t.endswith(")")) or t.endswith("-") or t.startswith("-")
+    try: v = float(t.strip("()").strip("-"))
+    except ValueError: return None
+    return -v if neg else v
+
+def _sheet_date(s: str):
+    for f in _DATE_FORMATS:
+        try: return datetime.strptime((s or "").strip(), f).date()
+        except ValueError: pass
+    return None
+
+def _due(s: str) -> tuple:
+    """(day of month, first date) from "15", "15th", "the 15th" or a date; (None, None) when it is neither."""
+    d = _sheet_date(s)
+    if d: return d.day, d
+    m = re.search(r"\b([1-9]|[12]\d|3[01])(?:st|nd|rd|th)?\b", s or "")
+    return (int(m.group(1)), None) if m else (None, None)
+
+def _freq(s: str) -> str:
+    t = (s or "").lower()
+    return "biweekly" if re.search(r"bi-?week|every (2|two) weeks|fortnight", t) else "weekly" if "week" in t else "semimonthly" if re.search(r"semi|twice a month|2x", t) else "yearly" if re.search(r"year|annual", t) else "monthly"
+
+def _interpret(kind: str, row: list, m: dict, sign: str) -> dict:
+    """One sheet row as it will be imported; "problem" says why it will be skipped. sign: expense / income (every amount is that) or sign (negative = money out)."""
+    cell = lambda k: row[int(m[k])].strip() if str(m.get(k, "")).isdigit() and int(m[k]) < len(row) else ""
+    label = cell("label")
+    if kind == "bills":
+        amt, (day, first) = _num(cell("amount")), _due(cell("due"))
+        k = cell("kind").lower()
+        income = any(w in k for w in ("income", "deposit", "paycheck", "salary", "wage")) or (not k and (sign == "income" or (sign == "sign" and (amt or 0) > 0)))
+        problem = "no name" if not label else "no amount" if amt is None else "no due day" if not day else ""
+        return {"label": label, "amount": abs(amt or 0), "kind": "income" if income else "expense", "frequency": _freq(cell("frequency")), "day": day, "first": first, "category": cell("category"), "auto": cell("auto").lower() in ("yes", "y", "true", "1", "auto", "x"), "problem": problem}
+    d, amt = _sheet_date(cell("date")), _num(cell("amount"))
+    if amt is None and (cell("debit") or cell("credit")): amt = (_num(cell("credit")) or 0) - abs(_num(cell("debit")) or 0)
+    elif amt is not None and sign != "sign": amt = abs(amt) if sign == "income" else -abs(amt)
+    return {"date": d, "label": label, "amount": amt, "category": cell("category"), "note": cell("note"), "problem": "no date" if not d else "no description" if not label else "no amount" if amt is None else ""}
+
+def _imports(gid: str) -> list:
+    conn = _conn(gid)
+    rows = [dict(r) for r in conn.execute("SELECT * FROM imports ORDER BY t DESC LIMIT 10")]
+    conn.close()
+    return rows
+
+def _import_html(gid: str, f: dict = None, msg: str = "") -> str:
+    """Step 1: paste cells or pick a file, say what the rows are. Step 2 (after Read): map the columns, check the preview, import. Recent imports can be undone."""
+    f = f or {}
+    text, kind, sign = f.get("text", ""), f.get("kind", "bills"), f.get("sign", "expense")
+    rows, hdr = _sheet_rows(text) if text.strip() else [], f.get("header") == "1" if f.get("read") else True   # the checkbox sends nothing when cleared, so "read" tells a cleared box from a first visit
+    head = rows[0] if rows and hdr else []
+    data = rows[1:] if head else rows
+    cols = [(str(i), f"{i + 1}: {(head[i] if i < len(head) else (data[0][i] if data and i < len(data[0]) else ''))[:30]}") for i in range(max((len(r) for r in rows), default=0))]
+    guess = lambda key, label: next((i for i, h in enumerate(head) if key in h.lower() or label.split()[0].lower() in h.lower()), None)
+    mapping = {k: f[f"map_{k}"] if f"map_{k}" in f else (str(g) if (g := guess(k, lbl)) is not None else "") for k, lbl, _ in _IMPORT_FIELDS[kind]}   # a column you chose, else the one whose header names the field
+    accts = _accounts(gid)
+    acct = f.get("account_id") or (accts[0]["id"] if accts else "")
+    sel = lambda name, opts, cur: f"""<select name="{name}" class="module-select">{"".join(f'<option value="{v}"{" selected" if v == cur else ""}>{_esc(t)}</option>' for v, t in opts)}</select>"""
+    step1 = f"""<label class="dim tiny">Paste cells copied from your sheet (or a CSV), or pick a CSV file - Google Sheets: File &gt; Download &gt; CSV.</label>
+                <textarea name="text" class="cm-input mono" rows="{4 if rows else 10}" placeholder="Name&#9;Amount&#9;Due">{_esc(text)}</textarea>
+                <div class="row"><input type="file" accept=".csv,.tsv,.txt" onchange="var x = this.files[0], t = this.form.querySelector('textarea[name=text]'); if (x) x.text().then(function(s) {{ t.value = s; }});">
+                <span class="dim tiny">The rows are</span>{sel("kind", [("bills", "bills / income that repeat"), ("transactions", "transactions (one-time, already happened)")], kind)}
+                <label class="row dim tiny"><input type="checkbox" name="header" value="1"{" checked" if hdr else ""}> first row is the column names</label><input type="hidden" name="read" value="1"></div>"""
+    if not rows: return f"""<div class="fsect-hd">Import</div><form hx-post="/im/in" hx-target="body" hx-swap="none" hx-include="this" class="node-form"><input type="hidden" name="type" value="finance_import_read"><input type="hidden" name="lvl" value="1">{step1}<div class="row"><span class="dim tiny grow">{msg}</span><button type="submit" class="ui-btn">Read</button></div></form>{_undo_html(gid)}"""
+    maps = "".join(f"""<label class="row"><span class="dim tiny" style="min-width:11rem">{lbl}{" *" if req else ""}</span>{sel(f"map_{k}", [("", "-")] + cols, mapping[k])}</label>""" for k, lbl, req in _IMPORT_FIELDS[kind])
+    signs = [("expense", "every amount is money out"), ("income", "every amount is money in"), ("sign", "by sign: negative = money out")]
+    items = [_interpret(kind, r, mapping, sign) for r in data]
+    ok = [x for x in items if not x["problem"]]
+    cells = (lambda x: (x["label"], _money(x["amount"]), x["kind"], f"""{x["frequency"]}, day {x["day"]}""", x["category"], "auto" if x["auto"] else "")) if kind == "bills" else (lambda x: (str(x["date"] or ""), x["label"], _money(x["amount"]) if x["amount"] is not None else "", x["category"], x["note"]))
+    heads = ("Name", "Amount", "Kind", "When", "Category", "Auto") if kind == "bills" else ("Date", "Description", "Amount", "Category", "Note")
+    preview = "".join(f"""<tr style="opacity:{.5 if x["problem"] else 1}">{"".join(f"<td>{_esc(c)}</td>" for c in cells(x))}<td style="color:#ff8c8c">{_esc(x["problem"])}</td></tr>""" for x in items[:15])
+    go = f"""<button type="button" class="ui-btn" hx-post="/im/in" hx-target="body" hx-swap="none" hx-include="closest form" hx-vals='{{"type": "finance_import_go", "lvl": 1}}'>Import {len(ok)} row(s)</button>"""
+    return f"""<div class="fsect-hd">Import</div><form hx-post="/im/in" hx-target="body" hx-swap="none" hx-include="this" class="node-form"><input type="hidden" name="type" value="finance_import_read"><input type="hidden" name="lvl" value="1">{step1}
+               <div class="fsect-hd">Columns</div><div class="settings-compact">{maps}<label class="row"><span class="dim tiny" style="min-width:11rem">Account</span>{sel("account_id", [(a["id"], a["label"]) for a in accts], acct)}</label><label class="row"><span class="dim tiny" style="min-width:11rem">Amounts</span>{sel("sign", signs, sign)}</label></div>
+               <div class="row"><span class="dim tiny grow">{len(data)} row(s): {len(ok)} will be imported, {len(items) - len(ok)} skipped (reason shown). {"Already-imported rows are skipped too (same name for bills; same date, description, amount and account for transactions)." if ok else ""} {msg}</span><button type="submit" class="ui-btn">Update preview</button>{go if ok and acct else ""}</div>
+               <table class="data-table"><thead><tr>{"".join(f"<th>{h}</th>" for h in heads)}<th></th></tr></thead><tbody>{preview}</tbody></table></form>{_undo_html(gid)}"""
+
+def _undo_html(gid: str) -> str:
+    rows = "".join(f"""<div class="list-row row"><span class="grow">{_esc(i["label"])}</span><span class="dim tiny">{i["t"][:16].replace("T", " ")} &#xB7; {len(json.loads(i["ids"]))} row(s)</span><button class="cm-qbtn" style="color:#ff5f5f" {_vals("import_undo", id=i["id"])} hx-confirm="Remove the {len(json.loads(i["ids"]))} row(s) this import added (and anything projected from them)? Edits you made to them are lost.">Undo</button></div>""" for i in _imports(gid))
+    return f"""<div class="fsect-hd" style="margin-top:1rem">Recent imports</div>{rows or '<div class="dim tiny">None yet.</div>'}"""
+
+async def _h_import_read(request, payload, imr): return imr.oob(_import_html(await _active_group(request), payload), "fin-import")
+
+async def _h_import_go(request, payload, imr):
+    """Adds the previewed rows: bills as recurring items (reminder 2 days before, active), transactions as confirmed entries (with their notes on that day). Rows already there are skipped. Recorded so it can be undone."""
+    gid, kind = await _active_group(request), payload.get("kind", "bills")
+    rows = _sheet_rows(payload.get("text", ""))
+    mapping = {k: payload.get(f"map_{k}", "") for k, _, _ in _IMPORT_FIELDS[kind]}
+    items = [x for x in (_interpret(kind, r, mapping, payload.get("sign", "expense")) for r in (rows[1:] if payload.get("header") == "1" else rows)) if not x["problem"]]
+    acct, today, ids, names, skipped = payload.get("account_id", ""), date.today(), [], [], 0
+    conn = _conn(gid)
+    if kind == "bills":
+        have = {r["label"].strip().lower() for r in conn.execute("SELECT label FROM recurring")}
+        for x in items:
+            if x["label"].lower() in have:
+                skipped += 1
+                continue
+            anchor = x["first"] or date(today.year, today.month, min(x["day"], calendar.monthrange(today.year, today.month)[1]))
+            ids.append(uuid.uuid4().hex[:10])
+            names.append(x["label"])
+            have.add(x["label"].lower())
+            conn.execute("INSERT INTO recurring (id,label,kind,account_id,to_account_id,amount,is_estimate,frequency,anchor_date,day1,day2,notify,notify_days_before,category,active,last_notified_date,auto_pay) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                         (ids[-1], x["label"], x["kind"], acct, None, x["amount"], 0, x["frequency"], anchor.isoformat(), x["day"], 15, 1, 2, x["category"], 1, None, 1 if x["auto"] else 0))
+    else:
+        for x in items:
+            if conn.execute("SELECT 1 FROM entries WHERE account_id=? AND date=? AND label=? AND ABS(amount-?)<0.005", (acct, x["date"].isoformat(), x["label"], x["amount"])).fetchone():
+                skipped += 1
+                continue
+            ids.append(uuid.uuid4().hex[:10])
+            names.append(x["label"])
+            conn.execute("INSERT INTO entries VALUES (?,?,?,?,?,?,?,?,?,?)", (ids[-1], acct, x["date"].isoformat(), x["label"], x["amount"], x["category"], 0, None, None, 1))
+            if x["note"]: conn.execute("INSERT INTO notes VALUES (?,?,?,?,?)", (uuid.uuid4().hex[:10], x["date"].isoformat(), f"""{x["label"]}: {x["note"]}""", request.state.user.username, datetime.now().isoformat(timespec="seconds")))
+    if ids: conn.execute("INSERT INTO imports VALUES (?,?,?,?,?)", (uuid.uuid4().hex[:10], datetime.now().isoformat(timespec="seconds"), kind, f"""{len(ids)} {kind}: {", ".join(names[:3])}{"..." if len(names) > 3 else ""}""", json.dumps(ids)))
+    conn.commit()
+    conn.close()
+    _materialize(gid)
+    return imr.oob(_import_html(gid, msg=f"Imported {len(ids)} row(s){f', skipped {skipped} already there' if skipped else ''}."), "fin-import")
+
+async def _h_import_undo(request, payload, imr):
+    gid = await _active_group(request)
+    conn = _conn(gid)
+    row = conn.execute("SELECT * FROM imports WHERE id=?", (payload.get("id", ""),)).fetchone()
+    if row:
+        ids = json.loads(row["ids"])
+        marks = ",".join("?" * len(ids))
+        if row["kind"] == "bills":
+            conn.execute(f"DELETE FROM recurring WHERE id IN ({marks})", ids)
+            conn.execute(f"DELETE FROM entries WHERE confirmed=0 AND recurring_id IN ({marks})", ids)
+        else: conn.execute(f"DELETE FROM entries WHERE id IN ({marks})", ids)
+        conn.execute("DELETE FROM imports WHERE id=?", (row["id"],))
+        conn.commit()
+    conn.close()
+    _materialize(gid)
+    return imr.oob(_import_html(gid, msg="Import undone." if row else ""), "fin-import")
+
+# --- For other modules (the "finance" service) ---
+
+def due_items(username: str, days: int = 14) -> list:
+    """Bills not marked paid that need you (auto-pay ones are left out), overdue or due within days, from every finance group username is in - for Muninn's Today and other summary views."""
+    out, end = [], (date.today() + timedelta(days=days)).isoformat()
+    for g in _user_groups(username):
+        _materialize(g["id"])
+        conn = _conn(g["id"])
+        auto = {r["id"] for r in conn.execute("SELECT id FROM recurring WHERE auto_pay=1")}
+        out += [{"date": e["date"], "label": e["label"], "amount": e["amount"], "where": g.get("label", g["id"]), "app": "Finance", "url": f"{_P}/"} for e in conn.execute("SELECT * FROM entries WHERE confirmed=0 AND amount<0 AND date<=?", (end,)) if e["recurring_id"] not in auto]
+        conn.close()
+    return sorted(out, key=lambda x: x["date"])
+
+_CMD_HELP = "@finance gas 40 - an expense paid today from your first cash account in the group Finance has open; also: 12.50 lunch yesterday | income 1200 paycheck | bill 85 internet 10/20 (not paid yet) | gas 40 from visa (an account by name)"
+_CMD_KINDS = {"income": ("income", 1), "+": ("income", 1), "bill": ("bill", 0), "owe": ("bill", 0), "expense": ("expense", 1), "spent": ("expense", 1), "paid": ("expense", 1)}   # first word -> (kind, confirmed)
+
+def _cmd_date(word: str):
+    """today / yesterday / tomorrow, a date as Import reads one, or M/D (this year); None when the word is not a date."""
+    w = word.lower()
+    if w in ("today", "yesterday", "tomorrow"): return date.today() + timedelta(days={"today": 0, "yesterday": -1, "tomorrow": 1}[w])
+    m = re.fullmatch(r"(\d{1,2})/(\d{1,2})", w)
+    try: return date(date.today().year, int(m[1]), int(m[2])) if m else _sheet_date(word)
+    except ValueError: return None
+
+async def _cmd_parse(request, text: str, ctx: dict) -> dict:
+    """One entry from a command line: an optional kind word first (income / bill = not paid yet / expense, default an expense already paid), the amount ($ or decimals win, else the first number),
+    a date word or date (default today), "from" or "to" and an account name (default the first cash account), and the rest as the label. Changes nothing."""
+    gid, words = await _active_group(request), text.split()
+    accounts = _accounts(gid)
+    if not accounts: return {"error": "Finance has no account yet - add one in Finance > Accounts"}
+    kind, confirmed = _CMD_KINDS.get(words[0].lower(), ("expense", 1)) if words else ("expense", 1)
+    words = words[1:] if words and words[0].lower() in _CMD_KINDS else words
+    acct = next((a for a in accounts if a["is_liquid"]), accounts[0])
+    j = next((j for j, w in enumerate(words[:-1]) if w.lower() in ("from", "to")), None)
+    if j is not None:
+        name = words[j + 1].lower()
+        acct = next((a for a in accounts if a["label"].lower().startswith(name)), None) or next((a for a in accounts if name in a["label"].lower()), None)
+        if not acct: return {"error": f"""no account named like "{words[j + 1]}" - accounts: {", ".join(a["label"] for a in accounts)}"""}
+        words = words[:j] + words[j + 2:]
+    d = next((x for x in map(_cmd_date, words) if x), None)
+    words = [w for w in words if not _cmd_date(w)] if d else words
+    nums = [(j, _num(w)) for j, w in enumerate(words) if re.search(r"\d", w) and _num(w) is not None]
+    pick = next((n for n in nums if "$" in words[n[0]]), None) or next((n for n in nums if "." in words[n[0]]), None) or (nums[0] if nums else None)
+    if not pick or not pick[1]: return {"error": "no amount - e.g. @finance gas 40"}
+    kind, confirmed = ("income", 1) if words[pick[0]].startswith("+") else (kind, confirmed)   # +1200 paycheck
+    label = " ".join(w for j, w in enumerate(words) if j != pick[0]).strip(" -:,")
+    if not label: return {"error": "say what it was for - e.g. @finance gas 40"}
+    amount, d = abs(pick[1]) if kind == "income" else -abs(pick[1]), d or date.today()
+    what = {"income": "Income", "bill": "Bill, not paid yet:", "expense": "Expense"}[kind]
+    return {"summary": f"""{what} {_money(abs(amount))} {label} - {d.strftime("%a %m-%d")} - {acct["label"]} ({_load_groups().get(gid, {}).get("label", gid)})""", "args": {"gid": gid, "account_id": acct["id"], "date": d.isoformat(), "label": label, "amount": amount, "confirmed": confirmed}}
+
+async def _cmd_run(request, args: dict) -> str:
+    """Adds the entry _cmd_parse read, as Quick Add would."""
+    if request.state.user.username not in _load_groups().get(args["gid"], {}).get("members", []): raise ValueError("you are not in that finance group")
+    conn = _conn(args["gid"])
+    conn.execute("INSERT INTO entries VALUES (?,?,?,?,?,?,?,?,?,?)", (uuid.uuid4().hex[:10], args["account_id"], args["date"], args["label"], args["amount"], "", 0, None, None, args["confirmed"]))
+    conn.commit(); conn.close()
+    return f"""added to Finance: {args["label"]} {_money(args["amount"])} on {args["date"]}{" (not paid yet)" if not args["confirmed"] else ""} - change or delete it in that day's view"""
 
 # --- Routes ---
 
@@ -792,11 +1205,13 @@ async def index(request: Request, join_group: str = ""):
             await ENV["set_state"](request, join_group, scope="user", namespace="finance", key="active_group")
     gid = await _active_group(request)
     state = await TM._load(request)
+    state["tabs"] = {**{k: dict(v) for k, v in TM.empty["tabs"].items()}, **state["tabs"]}   # tabs added since this person's tab state was saved
+    await TM._save(request, state)
     state, panel_html = await _render_panel(request, state)
     tab_bar = await TM.tab_bar_fn(state, "fin-tab-bar", "finance", 1, allow_new=False, closable=False)
     return ENV["templates"].TemplateResponse(name="base.html", request=request, context={"request": request, "user": request.state.user, "nesting_level": 1, "shell_id": IM.branch_id,
         "toolbars": {"top": UI.toolbar(side="top", content=tab_bar, size="2.5rem", id="fin-top", nesting_level=1, start_open=True, locked=True)},
-        "content": f'<div id="finance-panel" style="height:100%;overflow:hidden">{panel_html}</div>', "extra_css": CSS})
+        "content": f'<div id="finance-panel" style="height:100%;overflow:hidden">{panel_html}</div><div id="fin-modal"></div>', "extra_css": CSS})   # fin-modal: the day view is swapped in here (an intent answer without hx-swap-oob is dropped)
 
 @router.get("/export/{gid}")
 async def export_db(gid: str, request: Request):
@@ -818,4 +1233,8 @@ CSS = """
 .fin-day-num { font-weight:700; font-size:calc(var(--font-size)*0.8); }
 .fin-entry { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .fin-day-liquid { margin-top:auto; font-weight:600; font-size:calc(var(--font-size)*0.4); }
+.fin-chart { position:relative; height:9rem; margin:1.2rem 0 1.6rem; }
+.fin-chart svg { position:absolute; inset:0; width:100%; height:100%; overflow:visible; }
+.fin-ch-lbl { position:absolute; transform:translate(-50%, .2rem); font-size:.65rem; color:var(--text_muted); white-space:nowrap; pointer-events:none; }
+.fin-ch-dot { position:absolute; width:.55rem; height:.55rem; border-radius:50%; transform:translate(-50%, -50%); }
 """
