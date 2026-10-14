@@ -387,6 +387,101 @@ def _recurring_list_html(gid: str) -> str:
                     </div>"""
     return f'<div id="fin-recurring-list">{rows or "<div class=dim>No recurring items yet.</div>"}</div>'
 
+
+# --- Recurring as a table: every item one row, every value its own cell, saved when the cell changes (Tab moves on); filter, and fill one column for the rows shown ---
+
+_KINDS = (("expense", "Bill"), ("income", "Income"), ("wage", "Wage"), ("transfer", "Transfer"))
+_FREQS = (("weekly", "Weekly"), ("biweekly", "2 weeks"), ("semimonthly", "2x month"), ("monthly", "Monthly"), ("yearly", "Yearly"))
+_REC_COLS = {"label": "text", "kind": "kind", "account_id": "account", "amount": "money", "is_estimate": "bool", "frequency": "freq", "day1": "day", "day2": "day", "anchor_date": "date", "auto_pay": "bool", "notify": "bool", "notify_days_before": "int", "category": "text", "active": "bool"}
+
+async def _rec_view(request) -> dict: return {"view": "table", "q": "", "kind": "", **(await ENV["get_state"](request, scope="user", namespace="finance", key="rec_view") or {})}
+
+def _rec_value(col: str, v, accounts: dict):
+    """A cell's text as the stored value; ValueError when it cannot be one (the cell is marked and nothing is saved)."""
+    t, v = _REC_COLS[col], "" if v is None else str(v).strip()
+    if t == "bool": return 1 if v in ("1", "on", "true", "yes", "x") else 0
+    if t == "money":
+        n = _num(v)
+        if n is None: raise ValueError("not an amount")
+        return abs(n)
+    if t in ("int", "day"):
+        n = int(v)
+        if t == "day" and not 1 <= n <= 31: raise ValueError("day 1-31")
+        return n
+    if t == "date": return date.fromisoformat(v).isoformat()
+    if t == "kind" and v not in dict(_KINDS): raise ValueError("kind")
+    if t == "freq" and v not in dict(_FREQS): raise ValueError("frequency")
+    if t == "account" and v not in accounts: raise ValueError("no such account")
+    if col == "label" and not v: raise ValueError("a name is needed")
+    return v
+
+def _rec_cell(r: dict, col: str, accounts: dict) -> str:
+    t, v = _REC_COLS[col], r[col]
+    attrs = f"""name="v" class="module-select fin-cell fin-c-{t}" hx-post="/im/in" hx-target="body" hx-swap="none" hx-trigger="change" hx-vals='{json.dumps({"type": "finance_rec_cell", "lvl": 1, "id": r["id"], "col": col})}'"""
+    if t == "bool": return f"""<input type="checkbox" value="1" {"checked" if v else ""} {attrs}>"""
+    if t in ("kind", "freq", "account"): return f"""<select {attrs}>{"".join(f'<option value="{k}"{" selected" if k == v else ""}>{_esc(l)}</option>' for k, l in (_KINDS if t == "kind" else _FREQS if t == "freq" else [(k, a["label"]) for k, a in accounts.items()]))}</select>"""
+    kind = {"money": 'type="number" step="0.01" min="0"', "int": 'type="number" min="0" max="30"', "day": 'type="number" min="1" max="31"', "date": 'type="date"'}.get(t, 'type="text"')
+    return f"""<input {kind} value="{_esc(v if v is not None else "")}" {attrs}>"""
+
+def _rec_rows(gid: str, q: str, kind: str) -> list:
+    ql = q.lower()
+    return [r for r in _recurring(gid) if (not kind or r["kind"] == kind) and (not ql or ql in f"""{r["label"]} {r["category"]}""".lower())]
+
+def _recurring_table_html(gid: str, v: dict, msg: str = "") -> str:
+    rows, accounts = _rec_rows(gid, v["q"], v["kind"]), _account_map(gid)
+    head = "".join(f"<th>{h}</th>" for h in ("Name", "Kind", "Account", "Amount", "~", "How often", "Day", "2nd day", "From date", "Auto", "Notify", "days", "Category", "Active", ""))
+    body = "".join(f"""<tr style="opacity:{1 if r["active"] else .55}">{"".join(f"<td>{_rec_cell(r, c, accounts)}</td>" for c in _REC_COLS)}<td id="fin-rc-{r["id"]}" class="dim tiny"></td></tr>""" for r in rows)
+    chips = "".join(f"""<button class="chip"{' style="background:var(--accent);color:var(--bg)"' if v["kind"] == k else ""} {_vals("rec_view", kind="" if v["kind"] == k else k)}>{l}</button>""" for k, l in _KINDS)
+    fill_cols = "".join(f'<option value="{c}">{h}</option>' for c, h in (("day1", "Day"), ("day2", "2nd day"), ("frequency", "How often"), ("account_id", "Account"), ("auto_pay", "Auto"), ("notify", "Notify"), ("notify_days_before", "Notify days"), ("is_estimate", "Estimate"), ("active", "Active"), ("category", "Category"), ("anchor_date", "From date")))
+    fill = f"""<form class="row" {_vals("rec_fill", ids=",".join(r["id"] for r in rows))} hx-include="this" hx-confirm="Set this value on all {len(rows)} rows shown?"><span class="dim tiny">Fill</span><select name="col" class="module-select" style="width:auto">{fill_cols}</select><input name="v" class="module-select" placeholder="value" title="Yes / no columns: 1 or 0. How often: weekly, biweekly, semimonthly, monthly, yearly. Account: its name. Date: YYYY-MM-DD" style="width:9rem"><button type="submit" class="ui-btn">for the {len(rows)} shown</button></form>"""
+    return f"""<div class="row">{chips}<span class="grow"></span>{fill}</div>
+               {f'<div class="info-bar">{msg}</div>' if msg else ""}<div class="dim tiny" style="margin:.2rem 0">Each cell is saved when you leave it (Tab moves to the next). A value that cannot be used is not saved; the row's last column says why.</div>
+               <div style="overflow-x:auto"><table class="data-table fin-rec-table"><thead><tr>{head}</tr></thead><tbody>{body or '<tr><td colspan="15" class="dim">No recurring items match.</td></tr>'}</tbody></table></div>"""
+
+def _panel_recurring_body(gid: str, v: dict) -> str:
+    """Table (every value editable in place) or Cards (one item at a time, the full form); adding a new item uses the form in both."""
+    switch = "".join(f"""<button class="chip"{' style="background:var(--accent);color:var(--bg)"' if v["view"] == k else ""} {_vals("rec_view", view=k)}>{l}</button>""" for k, l in (("table", "Table"), ("cards", "Cards")))
+    form = f"""<details class="sec"{" open" if v["view"] == "cards" else ""}><summary>Add / Edit Recurring Item</summary><div id="fin-recurring-form">{_recurring_form_html(gid)}</div></details>"""
+    if v["view"] == "cards": return f"""<div class="row">{switch}</div>{_recurring_list_html(gid)}{form}"""
+    return f"""<div class="row">{switch}<input name="q" value="{_esc(v["q"])}" class="module-select" placeholder="Filter: name or category" style="width:14rem" {_vals("rec_view")} hx-trigger="keyup changed delay:400ms" hx-include="this"></div>
+               <div id="fin-rec-table">{_recurring_table_html(gid, v)}</div>{form}"""
+
+async def _h_rec_cell(request, payload, imr):
+    """One cell: stored at once and the projections rebuilt; the row's last cell says saved, or the cell is marked when the value cannot be used."""
+    gid, rid, col = await _active_group(request), payload["id"], payload["col"]
+    if col not in _REC_COLS: return imr
+    try: val = _rec_value(col, payload.get("v"), _account_map(gid))
+    except (ValueError, TypeError) as e: return imr.oob(f"""<span style="color:#ff5f5f">{_esc(col)}: {_esc(str(e) or "not a value")}</span>""", f"fin-rc-{rid}")
+    conn = _conn(gid)
+    conn.execute(f"UPDATE recurring SET {col}=? WHERE id=?", (val, rid))   # col is one of _REC_COLS' keys (checked above)
+    conn.commit()
+    conn.close()
+    _materialize(gid)
+    return imr.oob("&#x2713; saved", f"fin-rc-{rid}")
+
+async def _h_rec_view(request, payload, imr):
+    v = await _rec_view(request)
+    v.update({k: payload[k] for k in ("view", "q", "kind") if k in payload})
+    await ENV["set_state"](request, v, scope="user", namespace="finance", key="rec_view")
+    gid = await _active_group(request)
+    if "view" in payload: return imr.oob(_panel_recurring_body(gid, v), "fin-rec-body")
+    return imr.oob(_recurring_table_html(gid, v), "fin-rec-table")
+
+async def _h_rec_fill(request, payload, imr):
+    """One column set to one value on every row shown (the filter decides which); an account may be given by its name."""
+    gid, col, ids = await _active_group(request), payload.get("col", ""), [i for i in str(payload.get("ids", "")).split(",") if i]
+    accounts, v = _account_map(gid), await _rec_view(request)
+    raw = next((k for k, a in accounts.items() if a["label"].lower() == str(payload.get("v", "")).strip().lower()), payload.get("v")) if col == "account_id" else payload.get("v")
+    try: val = _rec_value(col, raw, accounts) if col in _REC_COLS else None
+    except (ValueError, TypeError) as e: return imr.oob(_recurring_table_html(gid, v, f"""Nothing changed - {_esc(col)}: {_esc(str(e) or "not a value")}"""), "fin-rec-table")
+    if col in _REC_COLS and ids:
+        conn = _conn(gid)
+        conn.executemany(f"UPDATE recurring SET {col}=? WHERE id=?", [(val, i) for i in ids])
+        conn.commit()
+        conn.close()
+        _materialize(gid)
+    return imr.oob(_recurring_table_html(gid, v, f"{len(ids)} row(s) set."), "fin-rec-table")
+
 # --- Panels ---
 
 async def _panel_calendar(request, gid):
@@ -406,7 +501,7 @@ def _panel_upcoming(gid, days): return f'<div style="padding:.9rem;height:100%;o
 def _panel_import(gid): return f'<div style="padding:.9rem;height:100%;overflow-y:auto;box-sizing:border-box"><div id="fin-import">{_import_html(gid)}</div></div>'
 
 def _panel_accounts(gid): return f'<div style="padding:.9rem;height:100%;overflow-y:auto;box-sizing:border-box">{_accounts_list_html(gid)}<div class="fsect-hd" style="margin-top:1rem">Add / Edit Account</div><div id="fin-account-form">{_account_form_html()}</div></div>'
-def _panel_recurring(gid): return f'<div style="padding:.9rem;height:100%;overflow-y:auto;box-sizing:border-box">{_recurring_list_html(gid)}<div class="fsect-hd" style="margin-top:1rem">Add / Edit Recurring Item</div><div id="fin-recurring-form">{_recurring_form_html(gid)}</div></div>'
+def _panel_recurring(gid, v): return f'<div style="padding:.9rem;height:100%;overflow-y:auto;box-sizing:border-box"><div id="fin-rec-body">{_panel_recurring_body(gid, v)}</div></div>'
 
 def _panel_settings(request, gid, warn=""):
     groups = _user_groups(request.state.user.username)
@@ -446,7 +541,7 @@ async def _render_panel(request, state):
     gid = await _active_group(request)
     active = state.get("active", "calendar")
     if active == "accounts": return state, _panel_accounts(gid)
-    if active == "recurring": return state, _panel_recurring(gid)
+    if active == "recurring": return state, _panel_recurring(gid, await _rec_view(request))
     if active == "settings": return state, _panel_settings(request, gid)
     if active == "breakdown": return state, _panel_breakdown(gid)
     if active == "upcoming": return state, _panel_upcoming(gid, await _up_days(request))
@@ -506,7 +601,8 @@ def init_module(env: dict):
         "finance_group_switch": [_h_group_switch], "finance_group_members_save": [_h_group_members_save], "finance_threshold_save": [_h_threshold_save],
         "finance_note_add": [_h_note_add], "finance_note_delete": [_h_note_delete], "finance_upcoming_days": [_h_upcoming_days], "finance_up_paid": [_h_up_paid], "finance_up_skip": [_h_up_skip],
         "finance_import_read": [_h_import_read], "finance_import_go": [_h_import_go], "finance_import_undo": [_h_import_undo],
-        "finance_plan_days": [_h_plan_days], "finance_plan_whatif": [_h_plan_whatif], "finance_plan_add": [_h_plan_add]})
+        "finance_plan_days": [_h_plan_days], "finance_plan_whatif": [_h_plan_whatif], "finance_plan_add": [_h_plan_add],
+        "finance_rec_cell": [_h_rec_cell], "finance_rec_view": [_h_rec_view], "finance_rec_fill": [_h_rec_fill]})
     ENV["register_service"]("finance", {"due_items": due_items, "command": {"help": _CMD_HELP, "parse": _cmd_parse, "run": _cmd_run, "aliases": ["fin"]}})   # Muninn's Today (and any summary view) lists bills that need you; @finance lines in Muninn captures add entries
     ENV["register_startup"](_notify_loop)   # init runs before the server's event loop exists; the loop starts with the server
     print("[finance] ready")
@@ -632,7 +728,7 @@ async def _h_recurring_save(request, payload, imr):
     _materialize(gid)
     imr.oob(_recurring_list_html(gid), "fin-recurring-list", swap="outerHTML")
     imr.oob(_recurring_form_html(gid), "fin-recurring-form", swap="outerHTML")
-    return imr
+    return imr.oob(_recurring_table_html(gid, await _rec_view(request)), "fin-rec-table")   # the Table view, when it is the one open
 
 async def _h_recurring_delete(request, payload, imr):
     gid = await _active_group(request)
@@ -1233,6 +1329,9 @@ CSS = """
 .fin-day-num { font-weight:700; font-size:calc(var(--font-size)*0.8); }
 .fin-entry { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .fin-day-liquid { margin-top:auto; font-weight:600; font-size:calc(var(--font-size)*0.4); }
+.fin-rec-table td { padding:.1rem .15rem; }
+.fin-cell { margin:0; padding:.15rem .3rem; min-width:0; }
+.fin-c-text { width:10rem; } .fin-c-money { width:6.5rem; } .fin-c-day, .fin-c-int { width:3.6rem; } .fin-c-date { width:9rem; } .fin-c-kind, .fin-c-freq { width:6.5rem; } .fin-c-account { width:8rem; }
 .fin-chart { position:relative; height:9rem; margin:1.2rem 0 1.6rem; }
 .fin-chart svg { position:absolute; inset:0; width:100%; height:100%; overflow:visible; }
 .fin-ch-lbl { position:absolute; transform:translate(-50%, .2rem); font-size:.65rem; color:var(--text_muted); white-space:nowrap; pointer-events:none; }
