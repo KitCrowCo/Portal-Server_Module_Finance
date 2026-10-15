@@ -6,7 +6,7 @@ directly readable by an external widget app with no server involvement.
 Liquid cash and debt are tracked separately and never netted automatically - the goal is
 two numbers a person can hold in their head, not a single misleading net-worth figure.
 """
-import io, re, csv, json, uuid, sqlite3, calendar, asyncio
+import io, re, csv, json, time, uuid, sqlite3, calendar, asyncio
 from pathlib import Path
 from datetime import date, timedelta, datetime
 from sqlalchemy import text
@@ -26,6 +26,7 @@ UI = BI = IM = TM = None
 
 def _esc(s): return str(s).replace("&","&amp;").replace("<","&lt;").replace(">","&gt;").replace('"',"&quot;")
 def _money(v): return f"${v:,.2f}" if v >= 0 else f"-${abs(v):,.2f}"
+def _signed(v): return f"+${v:,.2f}" if v > 0 else _money(v)   # money in (+) and out (-) on lists of single items; balances stay unsigned
 
 # --- Groups (household scoping) ---
 
@@ -145,6 +146,7 @@ def _materialize(gid: str, horizon_days: int = HORIZON_DAYS):
     conn.execute("DELETE FROM entries WHERE projected=1 AND confirmed=0 AND date>=?", (today.isoformat(),))
     for rec in [dict(r) for r in conn.execute("SELECT * FROM recurring WHERE active=1")]:
         skip = {r["date"] for r in conn.execute("SELECT date FROM exceptions WHERE recurring_id=?", (rec["id"],))}
+        first = next((o for o in _occurrences(rec, today, end) if o.isoformat() not in skip), None)
         for occ in _occurrences(rec, today, end):
             if occ.isoformat() in skip: continue
             if rec["kind"] == "wage":
@@ -156,9 +158,18 @@ def _materialize(gid: str, horizon_days: int = HORIZON_DAYS):
                 conn.execute("INSERT INTO entries VALUES (?,?,?,?,?,?,?,?,?,?)", (e1, rec["account_id"], occ.isoformat(), rec["label"], -abs(rec["amount"]), rec["category"], 1, rec["id"], e2, 0))
                 conn.execute("INSERT INTO entries VALUES (?,?,?,?,?,?,?,?,?,?)", (e2, rec["to_account_id"], occ.isoformat(), rec["label"], abs(rec["amount"]), rec["category"], 1, rec["id"], e1, 0))
             else:
-                sign = 1 if rec["kind"] == "income" else -1
-                conn.execute("INSERT INTO entries VALUES (?,?,?,?,?,?,?,?,?,?)", (uuid.uuid4().hex[:10], rec["account_id"], occ.isoformat(), rec["label"], sign * abs(rec["amount"]), rec["category"], 1, rec["id"], None, 0))
+                sign, amt = (1 if rec["kind"] == "income" else -1), abs(rec["amount"])
+                if rec["is_estimate"] and rec["kind"] == "expense" and occ == first: amt = max(0.0, amt - _spent_toward(conn, rec, occ))
+                conn.execute("INSERT INTO entries VALUES (?,?,?,?,?,?,?,?,?,?)", (uuid.uuid4().hex[:10], rec["account_id"], occ.isoformat(), rec["label"], sign * amt, rec["category"], 1, rec["id"], None, 0))
     conn.commit(); conn.close()
+
+def _spent_toward(conn, rec: dict, occ: date) -> float:
+    """Ongoing estimated spending (food, gas): what was already spent toward the current period - entries of your own (not from a schedule) since the previous occurrence whose category, or label, is the estimate's category (or its label when it has none).
+    The current period's projection is the estimate less this, never below zero; later periods keep the full estimate."""
+    key = (rec["category"] or rec["label"] or "").strip().lower()
+    prev = max(_occurrences(rec, occ - timedelta(days=400), occ - timedelta(days=1)), default=occ - timedelta(days=30))
+    rows = conn.execute("SELECT label, category, amount FROM entries WHERE recurring_id IS NULL AND amount<0 AND date>? AND date<=?", (prev.isoformat(), occ.isoformat())).fetchall()
+    return sum(-r["amount"] for r in rows if key and ((r["category"] or "").strip().lower() == key or (r["label"] or "").strip().lower() == key or (r["label"] or "").strip().lower().startswith(key + " ")))
 
 # --- Balance calculation ---
 
@@ -216,8 +227,8 @@ def _extended_grid(gid: str, center_year: int, center_month: int) -> list:
 def _day_cell_html(cell, gid) -> str:
     d, entries, liquid, in_month = cell["date"], cell["entries"], cell["liquid"], cell["in_month"]
     cls = "fin-day" + (" fin-day-today" if d == date.today() else "") + ("" if in_month else " fin-day-other-month")
-    rows = "".join(f"""<div class="fin-entry" style="color:{'#00ffa2' if e['amount']>=0 else '#ff8c8c'}" title="{_esc(e['label'])}">{_esc(e['label'][:14])} {_money(e['amount'])}{' ~' if not e.get('confirmed') and e.get('projected') else ''}</div>""" for e in entries[:3])
-    more_labels = "; ".join(f"{e['label']} {_money(e['amount'])}" for e in entries[3:])
+    rows = "".join(f"""<div class="fin-entry" style="color:{'#00ffa2' if e['amount']>=0 else '#ff8c8c'}" title="{_esc(e['label'])}">{_esc(e['label'][:14])} {_signed(e['amount'])}{' ~' if not e.get('confirmed') and e.get('projected') else ''}</div>""" for e in entries[:3])
+    more_labels = "; ".join(f"{e['label']} {_signed(e['amount'])}" for e in entries[3:])
     more = f'<div class="dim tiny" title="{_esc(more_labels)}">+{len(entries)-3} more</div>' if len(entries) > 3 else ""
     return f"""<div class="{cls}" hx-post="/im/in" hx-target="body" hx-swap="none" hx-vals='{json.dumps({"type":"finance_day_open","lvl":1,"date":d.isoformat()})}'>
                    <div class="fin-day-num">{d.day}{' <span class="dim tiny">&#x1F4DD;</span>' if cell["noted"] else ""}</div>{rows}{more}
@@ -392,7 +403,14 @@ def _recurring_list_html(gid: str) -> str:
 
 _KINDS = (("expense", "Bill"), ("income", "Income"), ("wage", "Wage"), ("transfer", "Transfer"))
 _FREQS = (("weekly", "Weekly"), ("biweekly", "2 weeks"), ("semimonthly", "2x month"), ("monthly", "Monthly"), ("yearly", "Yearly"))
-_REC_COLS = {"label": "text", "kind": "kind", "account_id": "account", "amount": "money", "is_estimate": "bool", "frequency": "freq", "day1": "day", "day2": "day", "anchor_date": "date", "auto_pay": "bool", "notify": "bool", "notify_days_before": "int", "category": "text", "active": "bool"}
+_REC_COLS = {"label": "text", "kind": "kind", "account_id": "account", "to_account_id": "account", "amount": "money", "hourly_rate": "money", "hours_per_day": "money", "deduction_pct": "money", "is_estimate": "bool", "frequency": "freq", "day1": "day", "day2": "day", "anchor_date": "date", "auto_pay": "bool", "notify": "bool", "notify_days_before": "int", "category": "text", "active": "bool"}
+_REC_HEAD = ("Name", "Kind", "Account", "To", "Amount", "$/hour", "Hours/day", "Deduct %", "~", "How often", "Day", "2nd day", "From date", "Auto", "Notify", "days", "Category", "Active", "")
+_REC_REDRAW = ("kind", "frequency", "notify")   # these change which other cells apply, so the table is drawn again
+
+def _rec_used(r: dict, col: str) -> bool:
+    """Whether a column means anything for this item: To only for transfers, Amount for everything but wages (paid by the hour), the wage columns only for wages, Day for monthly and twice-a-month items, 2nd day only for twice a month, the notice days only when Notify is on."""
+    k, f = r["kind"], r["frequency"]
+    return {"to_account_id": k == "transfer", "amount": k != "wage", "hourly_rate": k == "wage", "hours_per_day": k == "wage", "deduction_pct": k == "wage", "day1": f in ("monthly", "semimonthly"), "day2": f == "semimonthly", "notify_days_before": bool(r["notify"])}.get(col, True)
 
 async def _rec_view(request) -> dict: return {"view": "table", "q": "", "kind": "", **(await ENV["get_state"](request, scope="user", namespace="finance", key="rec_view") or {})}
 
@@ -416,7 +434,9 @@ def _rec_value(col: str, v, accounts: dict):
     return v
 
 def _rec_cell(r: dict, col: str, accounts: dict) -> str:
+    """One editable cell; a column that does not apply to this item shows "-" (its stored value is kept and still used if the item changes to a kind or frequency that needs it)."""
     t, v = _REC_COLS[col], r[col]
+    if not _rec_used(r, col): return f"""<span class="dim fin-c-{t}" style="display:inline-block;text-align:center" title="Not used for this item">-</span>"""
     attrs = f"""name="v" class="module-select fin-cell fin-c-{t}" hx-post="/im/in" hx-target="body" hx-swap="none" hx-trigger="change" hx-vals='{json.dumps({"type": "finance_rec_cell", "lvl": 1, "id": r["id"], "col": col})}'"""
     if t == "bool": return f"""<input type="checkbox" value="1" {"checked" if v else ""} {attrs}>"""
     if t in ("kind", "freq", "account"): return f"""<select {attrs}>{"".join(f'<option value="{k}"{" selected" if k == v else ""}>{_esc(l)}</option>' for k, l in (_KINDS if t == "kind" else _FREQS if t == "freq" else [(k, a["label"]) for k, a in accounts.items()]))}</select>"""
@@ -429,14 +449,14 @@ def _rec_rows(gid: str, q: str, kind: str) -> list:
 
 def _recurring_table_html(gid: str, v: dict, msg: str = "") -> str:
     rows, accounts = _rec_rows(gid, v["q"], v["kind"]), _account_map(gid)
-    head = "".join(f"<th>{h}</th>" for h in ("Name", "Kind", "Account", "Amount", "~", "How often", "Day", "2nd day", "From date", "Auto", "Notify", "days", "Category", "Active", ""))
+    head = "".join(f"<th>{h}</th>" for h in _REC_HEAD)
     body = "".join(f"""<tr style="opacity:{1 if r["active"] else .55}">{"".join(f"<td>{_rec_cell(r, c, accounts)}</td>" for c in _REC_COLS)}<td id="fin-rc-{r["id"]}" class="dim tiny"></td></tr>""" for r in rows)
     chips = "".join(f"""<button class="chip"{' style="background:var(--accent);color:var(--bg)"' if v["kind"] == k else ""} {_vals("rec_view", kind="" if v["kind"] == k else k)}>{l}</button>""" for k, l in _KINDS)
-    fill_cols = "".join(f'<option value="{c}">{h}</option>' for c, h in (("day1", "Day"), ("day2", "2nd day"), ("frequency", "How often"), ("account_id", "Account"), ("auto_pay", "Auto"), ("notify", "Notify"), ("notify_days_before", "Notify days"), ("is_estimate", "Estimate"), ("active", "Active"), ("category", "Category"), ("anchor_date", "From date")))
+    fill_cols = "".join(f'<option value="{c}">{h}</option>' for c, h in (("day1", "Day"), ("day2", "2nd day"), ("frequency", "How often"), ("account_id", "Account"), ("to_account_id", "To account"), ("hourly_rate", "$/hour"), ("hours_per_day", "Hours/day"), ("deduction_pct", "Deduct %"), ("auto_pay", "Auto"), ("notify", "Notify"), ("notify_days_before", "Notify days"), ("is_estimate", "Estimate"), ("active", "Active"), ("category", "Category"), ("anchor_date", "From date")))
     fill = f"""<form class="row" {_vals("rec_fill", ids=",".join(r["id"] for r in rows))} hx-include="this" hx-confirm="Set this value on all {len(rows)} rows shown?"><span class="dim tiny">Fill</span><select name="col" class="module-select" style="width:auto">{fill_cols}</select><input name="v" class="module-select" placeholder="value" title="Yes / no columns: 1 or 0. How often: weekly, biweekly, semimonthly, monthly, yearly. Account: its name. Date: YYYY-MM-DD" style="width:9rem"><button type="submit" class="ui-btn">for the {len(rows)} shown</button></form>"""
     return f"""<div class="row">{chips}<span class="grow"></span>{fill}</div>
                {f'<div class="info-bar">{msg}</div>' if msg else ""}<div class="dim tiny" style="margin:.2rem 0">Each cell is saved when you leave it (Tab moves to the next). A value that cannot be used is not saved; the row's last column says why.</div>
-               <div style="overflow-x:auto"><table class="data-table fin-rec-table"><thead><tr>{head}</tr></thead><tbody>{body or '<tr><td colspan="15" class="dim">No recurring items match.</td></tr>'}</tbody></table></div>"""
+               <div class="fin-rec-wrap"><table class="data-table fin-rec-table"><thead><tr>{head}</tr></thead><tbody>{body or f'<tr><td colspan="{len(_REC_HEAD)}" class="dim">No recurring items match.</td></tr>'}</tbody></table></div>"""
 
 def _panel_recurring_body(gid: str, v: dict) -> str:
     """Table (every value editable in place) or Cards (one item at a time, the full form); adding a new item uses the form in both."""
@@ -457,6 +477,7 @@ async def _h_rec_cell(request, payload, imr):
     conn.commit()
     conn.close()
     _materialize(gid)
+    if col in _REC_REDRAW: return imr.oob(_recurring_table_html(gid, await _rec_view(request), f"""Saved - the cells that apply to "{_esc(next((r["label"] for r in _recurring(gid) if r["id"] == rid), ""))}" changed."""), "fin-rec-table")
     return imr.oob("&#x2713; saved", f"fin-rc-{rid}")
 
 async def _h_rec_view(request, payload, imr):
@@ -520,6 +541,8 @@ def _panel_settings(request, gid, warn=""):
                        <button type="submit" class="button">+ Create Group</button>
                    </form>
                    <button type="button" class="cm-qbtn" style="color:#ff5f5f;margin-top:.4rem" hx-post="/im/in" hx-target="#finance-panel" hx-swap="innerHTML" hx-vals='{{"type":"finance_group_leave","lvl":1,"gid":"{gid}"}}' hx-confirm="Leave &#39;{_esc(cur.get('label',gid))}&#39;? If you&#39;re the only member, all its data is deleted permanently.">Leave / Delete This Group</button>
+                   <form class="row" style="margin-top:.5rem" {_vals_panel("group_rename", gid=gid)} hx-include="this"><input name="label" value="{_esc(cur.get("label", gid))}" class="module-select grow" required><button type="submit" class="ui-btn">Rename</button></form>
+                   {_copy_form_html(gid, groups)}
                    <div class="fsect-hd" style="margin-top:1rem">Group Members</div>
                    <p class="dim tiny">Only real usernames on this server are accepted - a typo is silently dropped rather than granting access to nobody.</p>
                    <form hx-post="/im/in" hx-target="#finance-panel" hx-swap="innerHTML" hx-include="this" style="display:flex;gap:.4rem">
@@ -533,8 +556,12 @@ def _panel_settings(request, gid, warn=""):
                        <input type="number" name="threshold" step="1" value="{cur.get('low_balance_threshold',100)}" class="module-select" style="width:8rem">
                        <button type="submit" class="button">Save</button>
                    </form>
-                   <div class="fsect-hd" style="margin-top:1rem">Export</div>
-                   <a class="ui-btn" href="{_P}/export/{gid}" download="{gid}.db">&#x2B07; Download SQLite file</a>
+                   <div class="fsect-hd" style="margin-top:1rem">Export / Import</div>
+                   <div class="row"><a class="ui-btn" href="{_P}/export/{gid}" download="{gid}.db">&#x2B07; Download SQLite file</a></div>
+                   <form class="row" hx-post="{_P}/import_db" hx-encoding="multipart/form-data" hx-target="#fin-import-db-msg" style="margin-top:.4rem"><input type="file" name="file" accept=".db,.sqlite,.sqlite3" required><button type="submit" class="ui-btn">&#x2B06; Import as a new group</button><span id="fin-import-db-msg" class="dim tiny"></span></form>
+                   <p class="dim tiny">A Finance file (from Download) becomes a new group of its own; nothing already here is changed. To move its contents into an existing group, switch to that group and use Copy above.</p>
+                   <div class="fsect-hd" style="margin-top:1rem">Date and time</div>
+                   <p class="dim tiny">Server time: {datetime.now().strftime("%Y-%m-%d %H:%M")} {time.strftime("%Z")}. "Today" in Finance (calendar, due dates, Upcoming) follows it. To change it, set TZ in the portal container's environment (docker-compose: <code>TZ=America/Los_Angeles</code>) and restart.</p>
                </div>"""
 
 async def _render_panel(request, state):
@@ -591,7 +618,7 @@ def init_module(env: dict):
     IM = ENV["InterfaceManager"](nesting_level=1, db_path="finance_im.db")
     TM = BI.TabManager(namespace="finance", tab_bar_id="fin-tab-bar", content_id="finance-panel", render_content_fn=_render_panel, intent_prefix="finance", IM=IM, scope="user", nesting_level=1, allow_new=False, closable=False, empty={"tabs": {"calendar":{"id":"calendar","order":0,"label":"Calendar","icon":"&#x1F4C5;"}, "upcoming":{"id":"upcoming","order":0.5,"label":"Upcoming","icon":"&#x1F4CB;"}, "plan":{"id":"plan","order":0.7,"label":"Plan","icon":"&#x1F4C8;"}, "accounts":{"id":"accounts","order":1,"label":"Accounts","icon":"&#x1F3E6;"}, "breakdown":{"id":"breakdown","order":2,"label":"Breakdown","icon":"&#x1F4CA;"}, "recurring":{"id":"recurring","order":3,"label":"Recurring","icon":"&#x1F501;"}, "import":{"id":"import","order":3.5,"label":"Import","icon":"&#x1F4E5;"}, "settings":{"id":"settings","order":4,"label":"Settings","icon":"&#x2699;"}}, "active":"calendar"})
     IM.scripts.update({
-        "finance_calendar_nav": [_h_calendar_nav], "finance_day_open": [_h_day_open],
+        "finance_calendar_nav": [_h_calendar_nav], "finance_day_open": [_h_day_open], "finance_group_rename": [_h_group_rename], "finance_group_copy": [_h_group_copy],
         "finance_quick_add": [_h_quick_add], "finance_correction": [_h_correction],
         "finance_entry_save": [_h_entry_save], "finance_entry_delete": [_h_entry_delete],
         "finance_account_form": [_h_account_form], "finance_account_save": [_h_account_save], "finance_account_delete": [_h_account_delete],
@@ -804,6 +831,45 @@ async def _h_group_create(request, payload, imr):
     await ENV["set_state"](request, gid, scope="user", namespace="finance", key="active_group")
     return imr.raw(_panel_settings(request, gid))
 
+def _copy_form_html(gid: str, groups: list) -> str:
+    """Copy every account, recurring item, entry, note and skip from another of your groups into this one (that group is left as it is)."""
+    others = "".join(f"""<option value="{g["id"]}">{_esc(g["label"])}</option>""" for g in groups if g["id"] != gid)
+    return f"""<form class="row" style="margin-top:.4rem" {_vals_panel("group_copy", gid=gid)} hx-include="this" hx-confirm="Copy everything from the chosen group into this one? The other group is not changed; running it twice adds nothing twice."><span class="dim tiny">Copy everything from</span><select name="src" class="module-select" style="width:auto">{others}</select><button type="submit" class="ui-btn">into this group</button></form>""" if others else ""
+
+def _member(request, gid: str) -> bool: return request.state.user.username in _load_groups().get(gid, {}).get("members", [])
+
+def _copy_db(src_gid: str, gid: str) -> dict:
+    """Rows of every Finance table of group src_gid added to group gid (same ids are not added twice; columns only one side has are left out). -> added rows per table."""
+    _conn(src_gid).close()   # brings the source file's columns up to date
+    conn, out = _conn(gid), {}
+    conn.execute("ATTACH DATABASE ? AS src", (str(_db_path(src_gid)),))
+    have = {r[0] for r in conn.execute("SELECT name FROM src.sqlite_master WHERE type='table'")}
+    for t in ("accounts", "recurring", "entries", "exceptions", "notes", "imports"):
+        if t not in have: continue
+        cols = ",".join(c for c in (r[1] for r in conn.execute(f"PRAGMA main.table_info({t})")) if c in {r[1] for r in conn.execute(f"PRAGMA src.table_info({t})")})
+        where = f" WHERE NOT (projected=1 AND confirmed=0 AND date>='{date.today().isoformat()}')" if t == "entries" else ""   # future projections are made again from the copied recurring items
+        out[t] = conn.execute(f"INSERT OR IGNORE INTO main.{t} ({cols}) SELECT {cols} FROM src.{t}{where}").rowcount   # t and cols come from the fixed table list and both files' own schemas
+    conn.commit()
+    conn.execute("DETACH DATABASE src")
+    conn.close()
+    _materialize(gid)
+    return out
+
+async def _h_group_rename(request, payload, imr):
+    gid, label = payload.get("gid", ""), str(payload.get("label", "")).strip()
+    if label and _member(request, gid):
+        groups = _load_groups()
+        groups[gid]["label"] = label
+        _save_groups(groups)
+    return imr.raw(_panel_settings(request, gid))
+
+async def _h_group_copy(request, payload, imr):
+    gid, src = payload.get("gid", ""), payload.get("src", "")
+    if not (_member(request, gid) and _member(request, src)) or gid == src: return imr
+    n = _copy_db(src, gid)
+    done = ", ".join(f"{v} {k}" for k, v in n.items() if v) or "nothing new (already copied)"
+    return imr.raw(_panel_settings(request, gid, f"""<div class="info-bar" style="margin-top:.4rem">Copied from {_esc(_load_groups()[src]["label"])}: {done}.</div>"""))
+
 async def _h_group_set_default(request, payload, imr):
     gid = payload.get("gid","")
     groups = _load_groups()
@@ -832,14 +898,14 @@ def _panel_breakdown(gid):
     recs = [dict(r) for r in conn.execute("SELECT * FROM recurring WHERE active=1")]
     conn.close()
     def _monthly_equiv(r):
-        mult = {"weekly": 4.333, "biweekly": 2.167, "semimonthly": 2.0, "monthly": 1.0, "yearly": 1/12}
-        return abs(r["amount"]) * mult.get(r["frequency"], 1.0)
-    income = sorted([r for r in recs if r["kind"] == "income"], key=_monthly_equiv, reverse=True)
+        mult = {"weekly": 52/12, "biweekly": 26/12, "semimonthly": 2.0, "monthly": 1.0, "yearly": 1/12}
+        return _per_payment(r) * mult.get(r["frequency"], 1.0)
+    income = sorted([r for r in recs if r["kind"] in ("income", "wage")], key=_monthly_equiv, reverse=True)
     bills = sorted([r for r in recs if r["kind"] in ("expense", "transfer")], key=_monthly_equiv, reverse=True)
     total_income = sum(_monthly_equiv(r) for r in income)
     total_bills = sum(_monthly_equiv(r) for r in bills)
     def _rows(items):
-        return "".join(f"""<tr><td>{_esc(r['label'])}</td><td class="dim">{r['frequency']}</td><td>{_money(abs(r['amount']))}{' ~est' if r['is_estimate'] else ''}</td><td>{_money(_monthly_equiv(r))}/mo</td></tr>""" for r in items) or '<tr><td colspan="4" class="dim">None active.</td></tr>'
+        return "".join(f"""<tr><td>{_esc(r['label'])}</td><td class="dim">{r['frequency']}</td><td>{_money(_per_payment(r))}{' avg (hourly)' if r['kind'] == 'wage' else ''}{' ~est' if r['is_estimate'] else ''}</td><td>{_money(_monthly_equiv(r))}/mo</td></tr>""" for r in items) or '<tr><td colspan="4" class="dim">None active.</td></tr>'
     surplus = total_income - total_bills
     return f"""<div style="padding:.9rem;height:100%;overflow-y:auto;box-sizing:border-box">
                    <div class="info-bar" style="justify-content:space-between">
@@ -853,6 +919,12 @@ def _panel_breakdown(gid):
                    <table class="data-table"><thead><tr><th>Item</th><th>Frequency</th><th>Amount</th><th>Monthly equiv.</th></tr></thead><tbody>{_rows(bills)}</tbody></table>
                    <p class="dim tiny" style="margin-top:.5rem">Monthly equivalents are a normalized comparison figure (e.g. weekly &#215; 4.333) - not a prediction of any specific month, which will vary based on how many of each cycle actually falls in it.</p>
                </div>"""
+
+def _per_payment(r: dict) -> float:
+    """What one occurrence comes to: its amount, or for a wage the average pay of one period - weekdays in the period (a year has 260) x hours per day x hourly rate, less deductions. The calendar uses each period's real weekday count."""
+    if r["kind"] != "wage": return abs(r["amount"] or 0)
+    days = {"weekly": 5, "biweekly": 10, "semimonthly": 260 / 24, "monthly": 260 / 12, "yearly": 260}.get(r["frequency"], 260 / 12)
+    return days * (r["hours_per_day"] or 8.0) * (r["hourly_rate"] or 0.0) * (1 - (r.get("deduction_pct") or 0) / 100)
 
 def _weekday_count(start: date, end: date) -> int:
     """Counts Mon-Fri days in [start, end] inclusive - the unit a standard hourly M-F schedule is paid against."""
@@ -895,6 +967,7 @@ def _pending_html(gid: str) -> str:
 # --- Notes: free text on any day (the day view lists them; the calendar and Upcoming mark the day) ---
 
 def _vals(action: str, **kw) -> str: return f"""hx-post="/im/in" hx-target="body" hx-swap="none" hx-vals='{json.dumps({"type": f"finance_{action}", "lvl": 1, **kw})}'"""
+def _vals_panel(action: str, **kw) -> str: return _vals(action, **kw).replace('hx-target="body" hx-swap="none"', 'hx-target="#finance-panel" hx-swap="innerHTML"')   # Settings answers with the whole panel
 
 def _notes(gid: str, day: str) -> list:
     conn = _conn(gid)
@@ -955,7 +1028,7 @@ def _upcoming_row(e: dict, today: str) -> str:
     pay_now = f"""<button class="btn-icon" title="Paying it now (leaves today)" {_vals("up_paid", id=e["id"], now=1)}>&#x1F4B5;</button>""" if e["amount"] < 0 else ""
     skip = f"""<button class="btn-icon" title="Skip this occurrence (the rest of its schedule stays)" {_vals("up_skip", id=e["id"])}>&#x23ED;</button>""" if e["recurring_id"] else ""
     return f"""<tr style="opacity:{.55 if e["after"] is None else 1}"><td style="cursor:pointer;white-space:nowrap" title="Open this day (notes, edits)" {_vals("day_open", date=e["date"])}>{when}</td><td>{_esc(e["label"])} {tags}</td><td class="dim tiny">{_esc(e["account"])}</td>
-               <td style="color:{"#00ffa2" if e["amount"] >= 0 else "#ff8c8c"}">{_money(e["amount"])}</td><td>{_money(e["after"]) if e["after"] is not None else ""}</td>
+               <td style="color:{"#00ffa2" if e["amount"] >= 0 else "#ff8c8c"}">{_signed(e["amount"])}</td><td>{_money(e["after"]) if e["after"] is not None else ""}</td>
                <td><div class="row" style="flex-wrap:nowrap;gap:.1rem"><button class="btn-icon" title="{"Paid" if e["amount"] < 0 else "Arrived"} (on its date; today if that has not come yet)" {_vals("up_paid", id=e["id"])}>&#x2713;</button>{pay_now}{skip}</div></td></tr>"""
 
 def _upcoming_html(gid: str, days: int) -> str:
@@ -1309,6 +1382,25 @@ async def index(request: Request, join_group: str = ""):
         "toolbars": {"top": UI.toolbar(side="top", content=tab_bar, size="2.5rem", id="fin-top", nesting_level=1, start_open=True, locked=True)},
         "content": f'<div id="finance-panel" style="height:100%;overflow:hidden">{panel_html}</div><div id="fin-modal"></div>', "extra_css": CSS})   # fin-modal: the day view is swapped in here (an intent answer without hx-swap-oob is dropped)
 
+@router.post("/import_db")
+async def import_db(request: Request):
+    """A Finance file (Download SQLite file) as a new group of this login's; existing groups are not touched. The file must hold Finance's accounts, recurring and entries tables."""
+    up = (await request.form()).get("file")
+    tmp = DATA_DIR / f"_upload_{uuid.uuid4().hex[:8]}.db"
+    tmp.write_bytes(await up.read())
+    try:
+        with sqlite3.connect(tmp) as c: have = {r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    except sqlite3.DatabaseError: have = set()
+    if not {"accounts", "recurring", "entries"} <= have:
+        tmp.unlink()
+        return HTMLResponse('<span style="color:#ff5f5f">Not a Finance file (no accounts / recurring / entries tables).</span>')
+    groups, gid = _load_groups(), f"g_{uuid.uuid4().hex[:10]}"
+    groups[gid] = {"label": f"""{Path(up.filename).stem} (imported {date.today().isoformat()})""", "members": [request.state.user.username], "low_balance_threshold": 100.0, "last_low_balance_notify": None}
+    tmp.rename(_db_path(gid))
+    _save_groups(groups)
+    _materialize(gid)
+    return HTMLResponse(f"""&#x2713; Imported as "{_esc(groups[gid]["label"])}" - pick it under Active Group.""")
+
 @router.get("/export/{gid}")
 async def export_db(gid: str, request: Request):
     groups = _load_groups()
@@ -1330,6 +1422,10 @@ CSS = """
 .fin-entry { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .fin-day-liquid { margin-top:auto; font-weight:600; font-size:calc(var(--font-size)*0.4); }
 .fin-rec-table td { padding:.1rem .15rem; }
+.fin-rec-wrap { overflow:auto; max-height:calc(100vh - 12rem); }
+.fin-rec-table thead th { position:sticky; top:0; z-index:2; background:var(--bg_panel, var(--bg)); }
+.fin-rec-table td:first-child, .fin-rec-table th:first-child { position:sticky; left:0; z-index:1; background:var(--bg_panel, var(--bg)); }
+.fin-rec-table thead th:first-child { z-index:3; }
 .fin-cell { margin:0; padding:.15rem .3rem; min-width:0; }
 .fin-c-text { width:10rem; } .fin-c-money { width:6.5rem; } .fin-c-day, .fin-c-int { width:3.6rem; } .fin-c-date { width:9rem; } .fin-c-kind, .fin-c-freq { width:6.5rem; } .fin-c-account { width:8rem; }
 .fin-chart { position:relative; height:9rem; margin:1.2rem 0 1.6rem; }
